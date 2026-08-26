@@ -1,0 +1,267 @@
+---
+title: "Bayesian Intensity Modeling"
+format: html
+editor: visual
+---
+
+```{r}
+#| message: false
+#| warning: false
+
+
+# load libraries
+library(ggplot2)
+library(tidyverse)
+
+library(tidybayes)
+library(brms)
+
+library(here)
+
+library(rcarbon)
+library(c14bazAAR)
+
+library(sf)
+library(terra)
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+```
+
+```{r}
+seed = 1
+set.seed(1)
+# Load data from southern African database
+
+# set directory
+dir = here::here()
+
+# read in and modify data names and assign as date list for c14bazAAR
+c14_za <- read_csv(paste0(dir, "/data/SARD_Mar2021_14C.csv")) |>
+  rename(c14age = Date, c14std = Uncertainty,  labnr = 'Lab ID',
+         lon = DecdegE, lat = DecdegS,
+         material = 'Material dated', species = Species) |>
+  as.c14_date_list()
+
+```
+
+```{r}
+#filter to remove human remains as they produce errors when calibrating
+za <- c14_za |>
+  filter(species != "Homo sapiens" | is.na(species)) |>
+  
+  # filter by dates older than 200 years and less than 50 ka
+  filter(c14age > 200, c14age < 50000)
+
+
+# filter by terrestrial material and apply the terrestrial calibration curve
+za_terr <- za |>
+  filter(!material %in% c('Marine shell', 'marine shell',
+                          'marine other', 'iron')) |>
+  drop_na(c14age, c14std)
+
+za_terr_cal <- rcarbon::calibrate(za_terr$c14age , za_terr$c14std,
+                                      calCurves = 'shcal20',
+                                      ids = za_terr$labnr)
+
+# filter by marine material and apply marien curve and offset
+za_marine <- za |>
+  filter(material %in% c('Marine shell', 'marine shell',
+                         'marine other')) |>
+  drop_na(c14age, c14std)
+
+za_marine_cal <- rcarbon::calibrate(za_marine$c14age, 
+                                    za_marine$c14std,
+                                    calCurves = rep('marine20',
+                                                    length(za_marine$labnr)),
+                                    resOffset = rep(187, length(za_marine$labnr)),
+                                    resErrors = rep(18, length(za_marine$labnr)),
+                                    ids = za_marine$labnr)
+
+# combine data
+za_cal <- rcarbon::combine(za_terr_cal, za_marine_cal)
+```
+
+```{r}
+# convert dates to a tibble object and join the original table by lab ID
+za_comb <- za_cal |> as_tibble() |>
+  cbind(za_cal$metadata) |>
+  rename(labnr = DateID) |>
+  right_join(za)
+```
+
+```{r}
+# filter by late pleistocene
+max_age <- 10000 
+min_age <- 1500
+temp_res <- 500
+  
+za_21ka <- za_comb |>
+  filter(c14age < max_age)
+
+# generate temporal grids
+time_grid <- seq(
+  from = max_age,
+  to = min_age,
+  by = -(temp_res)
+)
+
+
+za_21ka$calBP <- unlist(
+  
+  lapply(
+  
+    1:length(za_21ka$grids),
+  
+    function(x) {
+      
+      val <- za_21ka$grids[[x]]$PrDens
+      if (length(val) == 0) return(NA)
+    
+      za_21ka$grids[[x]]$calBP[which.max(za_21ka$grids[[x]]$PrDens)]
+    
+    }
+  
+  )
+)
+
+```
+
+```{r}
+sites_sf <- st_as_sf(
+  za_21ka,
+  coords = c("lon", "lat"),
+  crs = 4326
+)
+
+sites_proj <- st_transform(
+  sites_sf,
+  32734
+)
+ 
+coords <- st_coordinates(sites_proj)
+
+za_21ka$x <- coords[,1]
+za_21ka$y <- coords[,2]
+
+study_area <- st_bbox(sites_proj) |>
+  st_as_sfc() |>
+  st_buffer(dist = 50000) |>
+  vect()
+
+r <- rast(
+  ext(study_area),
+  resolution = 10000,
+  crs = st_crs(sites_proj)$wkt
+)
+
+values(r) <- 1 # Gives every cell a value
+```
+
+```{r}
+grid <- as.data.frame(
+  r,
+  xy = TRUE,
+  na.rm = TRUE
+)
+
+names(grid) <- c(
+  "cell",
+  "x",
+  "y"
+)
+
+c14_sf <- st_as_sf(
+  za_21ka,
+  coords = c("x", "y"),
+  crs = st_crs(sites_proj)
+)
+
+grid_sf <- st_as_sf(
+  grid,
+  coords = c("x", "y"),
+  crs = st_crs(sites_proj)
+)
+
+cell_id <- st_nearest_feature(
+  c14_sf,
+  grid_sf
+)
+
+za_21ka$cell <- cell_id
+```
+
+```{r}
+model_grid <- expand_grid(
+  cell = 1:nrow(grid),
+  time = time_grid
+)
+
+model_grid <- model_grid |>
+  left_join(
+    grid |>
+      mutate(cell = row_number()),
+    by = "cell"
+  )
+```
+
+```{r}
+observations <- za_21ka |>
+  filter(
+    calBP >= min_age,
+    calBP <= max_age
+  ) |>
+  mutate(
+    time_bin = round(calBP / temp_res) * temp_res
+  ) |>
+  count(
+    cell,
+    time_bin,
+    name = "n_dates"
+  )
+
+
+
+model_grid <- model_grid |>
+  left_join(
+    observations,
+    by = c(
+      "cell",
+      "time" = "time_bin"
+    )
+  ) |>
+  mutate(
+    n_dates = replace_na(n_dates, 0)
+  )
+```
+
+```{r}
+# Run first Bayesian model to estimate lambda
+fit <- brm(
+  n_dates ~
+    1 +
+    factor(cell) +
+    factor(time),
+  
+  family = poisson(),
+  
+  data = model_grid,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept"),
+    prior(normal(0, 1), class = "b")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(4),
+  backend = 'cmdstanr'
+)
+```
