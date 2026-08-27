@@ -30,6 +30,10 @@ library(bayesplot)
 
 
 library(dbscan)
+
+require(doSNOW)
+require(doParallel)
+require(doRNG)
 ```
 
 ```{r}
@@ -50,12 +54,17 @@ c14_za <- read_csv(paste0(dir, "/data/SARD_Mar2021_14C.csv")) |>
 ```
 
 ```{r}
+# filter by late pleistocene
+max_age <- 21000 
+min_age <- 1500
+temp_res <- 100
+
 #filter to remove human remains as they produce errors when calibrating
 za <- c14_za |>
   filter(species != "Homo sapiens" | is.na(species)) |>
   
   # filter by dates older than 200 years and less than 50 ka
-  filter(c14age > 200, c14age < 50000)
+  filter(c14age > min_age, c14age < max_age)
 
 
 # filter by terrestrial material and apply the terrestrial calibration curve
@@ -67,6 +76,8 @@ za_terr <- za |>
 za_terr_cal <- rcarbon::calibrate(za_terr$c14age , za_terr$c14std,
                                       calCurves = 'shcal20',
                                       ids = za_terr$labnr)
+
+terr_bins <- binPrep(za_terr$Site, ages = za_terr_cal, h = 250)
 
 # filter by marine material and apply marien curve and offset
 za_marine <- za |>
@@ -82,8 +93,205 @@ za_marine_cal <- rcarbon::calibrate(za_marine$c14age,
                                     resErrors = rep(18, length(za_marine$labnr)),
                                     ids = za_marine$labnr)
 
+marine_bins <- binPrep(za_marine$Site, ages = za_marine_cal, h = 250)
+
 # combine data
 za_cal <- rcarbon::combine(za_terr_cal, za_marine_cal)
+```
+
+```{r}
+time_range =  c(max_age, min_age)
+time_range_df = data.frame(calBP = max_age:min_age)
+
+
+
+za_cal_site <- za_cal |>
+  as_tibble()
+
+# Need to sample sites and dates, then combine
+za_spd_df <- tibble(site = character(),
+                    calBP = numeric(),
+                    PrDens = numeric())
+
+for(i in unique(za$labnr)){
+  
+
+    
+    
+    tmp_site <- za |>
+      filter(labnr == i) |>
+      select(Site)
+    
+    tmp_za <- za |>
+      filter(Site == tmp_site$Site)
+    
+    
+    za_terr <- tmp_za |>
+      filter(!material %in% c('Marine shell', 'marine shell',
+                              'marine other', 'iron')) |>
+      drop_na(c14age, c14std)
+    
+    if(dim(za_terr)[1] != 0){
+    
+    za_terr_cal <- rcarbon::calibrate(za_terr$c14age , za_terr$c14std,
+                                      calCurves = 'shcal20',
+                                      ids = za_terr$labnr)
+    
+    }
+    
+    # filter by marine material and apply marien curve and offset
+    za_marine <- tmp_za |>
+      filter(material %in% c('Marine shell', 'marine shell',
+                             'marine other')) |>
+      drop_na(c14age, c14std)
+    if(dim(za_marine)[1] != 0){
+    
+      za_marine_cal <- rcarbon::calibrate(za_marine$c14age, 
+                                          za_marine$c14std,
+                                          calCurves = rep('marine20',
+                                                          length(za_marine$labnr)),
+                                          resOffset = rep(187, length(za_marine$labnr)),
+                                          resErrors = rep(18, length(za_marine$labnr)),
+                                          ids = za_marine$labnr)
+    }
+    
+    # combine data
+    if((dim(za_terr)[1] == 0 & dim(za_marine)[1] != 0)){
+      za_cal <- za_marine_cal
+    } else if((dim(za_terr)[1] != 0 & dim(za_marine)[1] == 0)){
+      za_cal <- za_terr_cal
+    } else{
+      za_cal <- rcarbon::combine(za_terr_cal, za_marine_cal)
+    }
+    
+    
+    target_bins = binPrep(sites = c(za_terr$Site, za_marine$Site),
+                          ages = c(za_terr$c14age, za_marine$c14age), h = 100)
+    
+    
+    tmp_spd = spd(x = za_cal,
+                  bins = target_bins, 
+                  timeRange = c(max_age, min_age), 
+                  datenormalised = FALSE,
+                  runm = 100)
+    
+    tmp_spd_df <- as_tibble(tmp_spd$grid)
+    
+    za_spd_df <- za_spd_df |>
+      add_row(site = tmp_site$Site,
+              calBP = tmp_spd_df$calBP,
+              PrDens = tmp_spd_df$PrDens)
+}
+```
+
+```{r}
+time_range =  c(max_age, min_age)
+time_range_df = data.frame(calBP = max_age:min_age)
+
+# Assign bins to reduce excavation biases
+target_bins = binPrep(sites = c(za_terr$Site, za_marine$Site),
+                      ages = c(za_terr$c14age, za_marine$c14age), h = 250)
+
+za_spd = spd(x = za_cal,
+              bins = target_bins, 
+              timeRange = c(max_age, min_age), 
+              datenormalised = FALSE,
+              runm = 100)
+
+za_spd_df <- as_tibble(za_spd$grid)
+
+n = 10
+  
+dates_samp <- dplyr::slice_sample(n = nrow(za |> 
+                                             dplyr::distinct(Site)),
+                                  za_spd_df, 
+                                  weight_by = za_spd_df$PrDens,
+                                  replace = TRUE) |>
+  dplyr::select(calBP)
+
+i = temp_res
+bin_num = seq(time_range[1], time_range[2], by = -i)
+    
+
+lambda <- dates_samp |>
+  dplyr::group_by(calBP) |>
+  dplyr::summarize(count = dplyr::n()) |>
+  dplyr::right_join(time_range_df) |>
+  dplyr::arrange(calBP) |>
+  dplyr::mutate(count = tidyr::replace_na(count, 0)) |>
+  dplyr::mutate(
+      bin = cut(
+        calBP,
+        breaks = seq(time_range[1], time_range[2], by = -i),
+        include.lowest = TRUE
+      )
+    ) |>
+  dplyr::group_by(bin) |>
+  dplyr::summarize(
+      s = sum(count),
+      lower = as.numeric(unlist(regmatches(bin, gregexpr("[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?", bin))))[1],
+      upper = as.numeric(unlist(regmatches(bin, gregexpr("[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?", bin))))[2],
+      dist = abs(upper - lower),
+      rate = s / dist,
+      bin_size = i,
+      .groups = "drop"
+    ) -> za_samp
+
+    
+    
+local_lambda <- lambda |>
+  arrange(desc(upper)) |>
+  group_by(bin_size, bin, upper) |>
+  summarize(
+    local_rate = mean(rate),
+    .groups = "drop"
+  ) |>
+  arrange(desc(upper))
+
+
+# sample via poisson distribution
+n = 1
+  
+i = max(local_lambda$bin_size)
+
+local_l <- local_lambda |>
+  filter(bin_size == i)
+
+  count_df <- local_l |>
+  mutate(
+      count = rpois(
+        n = n(),
+        lambda = local_rate * bin_size
+      )
+    ) |>
+    dplyr::arrange(desc(upper))
+    
+time_ = dplyr::tibble(calBP = seq(time_range[1], time_range[2], -i),
+                      bin_size = i)
+    
+if(nrow(count_df) != nrow(time_)){
+    time_ = time_[-1,]
+  }
+    
+comb_df = cbind(time_, count_df)
+    
+
+
+za_pois_all <- comb_df |>
+  select(-bin_size)
+
+
+```
+
+```{r}
+za_pois_all |>
+  rename(Count = count) |>
+  ggplot(aes(x = calBP, y = Count, fill = Count))+
+  geom_bar(stat = "identity") +
+  scale_fill_gradient(low = "darkorange", high = "darkblue") +
+  xlab("Calibrated Years BP")+
+  theme_minimal(base_size = 8)+
+  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
 ```
 
 ```{r}
@@ -124,7 +332,7 @@ study_area <- st_bbox(sites_proj) |>
 za_holocene <- sites_proj |>
   mutate(x = st_coordinates(sites_proj)[,1],
          y = st_coordinates(sites_proj)[,2]) |>
-  filter(c14age < 21000) 
+  filter(c14age < max_age) 
 
 za_holocene |>
   group_by(`Province or district`) |>
@@ -137,7 +345,7 @@ ggplot()+
 ```{r}
 
 nn <- frNN(za_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
-           eps = 110000)
+           eps = 120000)
 
 hist(lengths(adjacencylist(nn)),
      xlab = "k", main="Number of Neighbors",
@@ -178,8 +386,7 @@ clustered_data |>
   filter(Site_ex == 1) -> site_exc
 
 #  Remove the noise cluster and clusters with too few site-specific observations
-clustered_data <- clustered_data |>
-  filter(!(cluster %in% c(0, site_exc$cluster)))
+clustered_data <- clustered_data |> filter(!(cluster %in% c(0, site_exc$cluster)))
   
 # Explore clustered data
 ggplot()+
@@ -187,11 +394,6 @@ ggplot()+
 ```
 
 ```{r}
-# filter by late pleistocene
-max_age <- 12000 
-min_age <- 1500
-temp_res <- 500
-
 # generate temporal grids
 time_grid <- seq(
   from = max_age,
@@ -228,7 +430,12 @@ fit_df <- clustered_data |>
   ) |>
   mutate(
     time_bin = round(calBP / temp_res) * temp_res
+    
   ) |>
+  
+  full_join(za_pois_all |> rename(time_bin = calBP) |>
+              select(time_bin, count), by = "time_bin") 
+  
   count(
     cluster,
     time_bin,
