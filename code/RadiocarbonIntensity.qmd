@@ -11,6 +11,7 @@ editor: visual
 
 # load libraries
 library(ggplot2)
+library(ggridges)
 library(tidyverse)
 
 library(tidybayes)
@@ -26,6 +27,9 @@ library(terra)
 library(cmdstanr)
 library(posterior)
 library(bayesplot)
+
+
+library(dbscan)
 ```
 
 ```{r}
@@ -90,6 +94,677 @@ za_comb <- za_cal |> as_tibble() |>
   right_join(za)
 ```
 
+# Hierarchical Modeling
+
+```{r}
+sites_sf <- st_as_sf(
+  za_comb,
+  coords = c("lon", "lat"),
+  crs = 4326
+)
+
+sites_proj <- st_transform(
+  sites_sf,
+  32734
+)
+
+coords <- st_coordinates(sites_proj)
+
+za_coords <- za_comb |>
+  mutate(x = coords[,1],
+         y = coords[,2])
+
+study_area <- st_bbox(sites_proj) |>
+  st_as_sfc() |>
+  st_buffer(dist = 10000) |>
+  vect()
+```
+
+```{r}
+za_holocene <- sites_proj |>
+  mutate(x = st_coordinates(sites_proj)[,1],
+         y = st_coordinates(sites_proj)[,2]) |>
+  filter(c14age < 21000) 
+
+za_holocene |>
+  group_by(`Province or district`) |>
+  summarize(count = n())
+  
+ggplot()+
+  geom_sf(data = za_holocene, aes(color = `Province or district`))
+```
+
+```{r}
+
+nn <- frNN(za_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
+           eps = 110000)
+
+hist(lengths(adjacencylist(nn)),
+     xlab = "k", main="Number of Neighbors",
+     sub = paste("Neighborhood size eps =", nn$eps))
+
+#i <- 1
+#nn$id[[i]]
+#nn$dist[[i]]
+#plot(za_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
+     #col = ifelse(seq_len(nrow(za_holocene)) %in% nn$id[[i]], "red", "black"))
+
+
+
+clustered_data <- za_holocene |>
+  distinct(Site, .keep_all = TRUE) |>
+  select(Site) |>
+  
+  mutate(cluster = {
+    
+    # Run DBSCAN (adjust eps and minPts to your data's scale)
+    res <- dbscan(nn, minPts = 5)
+    
+    # Return cluster assignments (0 represents noise/outliers)
+    res$cluster
+  }) |>
+  st_drop_geometry() |>
+  
+  right_join(za_holocene, by = "Site") |>
+  st_sf()
+
+clustered_data |>
+  group_by(cluster) |>
+  mutate(n_cluster = n()) |>
+  filter(n_cluster < 15) |>
+  group_by(Site, cluster, n_cluster) |>
+  summarize(n_site = n()) |>
+  mutate(Site_ex = ifelse((n_cluster == n_site) | (n_site < 10), 1, 0)) |>
+  filter(Site_ex == 1) -> site_exc
+
+#  Remove the noise cluster and clusters with too few site-specific observations
+clustered_data <- clustered_data |>
+  filter(!(cluster %in% c(0, site_exc$cluster)))
+  
+# Explore clustered data
+ggplot()+
+  geom_sf(data = clustered_data, aes(color = factor(cluster)))
+```
+
+```{r}
+# filter by late pleistocene
+max_age <- 12000 
+min_age <- 1500
+temp_res <- 500
+
+# generate temporal grids
+time_grid <- seq(
+  from = max_age,
+  to = min_age,
+  by = -(temp_res)
+)
+
+
+clustered_data$calBP <- unlist(
+  
+  lapply(
+    
+    1:length(clustered_data$grids),
+    
+    function(x) {
+      
+      val <- clustered_data$grids[[x]]$PrDens
+      if (length(val) == 0) return(NA)
+      
+      clustered_data$grids[[x]]$calBP[which.max(clustered_data$grids[[x]]$PrDens)]
+      
+    }
+    
+  )
+)
+```
+
+```{r}
+fit_df <- clustered_data |>
+  
+  filter(
+    calBP >= min_age,
+    calBP <= max_age
+  ) |>
+  mutate(
+    time_bin = round(calBP / temp_res) * temp_res
+  ) |>
+  count(
+    cluster,
+    time_bin,
+    name = "n_dates"
+  ) |>
+  
+  mutate(time_s = as.numeric(scale(time_bin)),
+       cluster_fct = factor(cluster),
+       cluster_num = as.numeric(cluster))
+```
+
+## Bayesian Modeling
+
+```{r}
+# Time
+seed <- seed + 1
+fit_time <- brm(
+  n_dates ~
+    1 + time_s,
+  
+  family = poisson(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept"),
+    prior(normal(0, 1), class = "b")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(4),
+  backend = 'cmdstanr',
+  seed = seed
+)
+
+# Space
+seed <- seed + 1
+fit_space_fct <- brm(
+  n_dates ~
+    1 + cluster_fct,
+  
+  family = poisson(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept"),
+    prior(normal(0, 1), class = "b")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(4),
+  backend = 'cmdstanr',
+  seed = seed
+)
+
+# Space
+seed <- seed + 1
+fit_space_h <- brm(
+  n_dates ~
+    1 + (1|cluster_fct),
+  
+  family = poisson(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(4),
+  backend = 'cmdstanr',
+  seed = seed
+)
+
+# Space + Time
+seed <- seed + 1
+fit_space_time <- brm(
+  n_dates ~
+    1 + time_s + (1|cluster_fct),
+  
+  family = poisson(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(4),
+  backend = 'cmdstanr',
+  seed = seed
+)
+
+
+# Varying slope and intercept
+seed <- seed + 1
+fit_space_time <- brm(
+  n_dates ~
+    1 + time_s + (time_s|cluster_fct),
+  
+  family = poisson(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(4),
+  backend = 'cmdstanr',
+  seed = seed
+)
+```
+
+```{r}
+cluster_draws <- fit_space_h |>
+  spread_draws(
+    r_cluster_fct[cluster_fct, term],
+    regex = TRUE
+  )
+
+cluster_draws <- as_draws_df(fit_space_h)
+
+cluster_summary <- fit_space_h |>
+  spread_draws(
+    r_cluster_fct[cluster, term]
+  ) |>
+  filter(term == "Intercept") |>
+  group_by(cluster) |>
+  summarise(
+    mean = exp(mean(r_cluster_fct)),
+    median = exp(median(r_cluster_fct)),
+    lower = exp(quantile(r_cluster_fct, 0.025)),
+    upper = exp(quantile(r_cluster_fct, 0.975)),
+    .groups = "drop"
+  )
+
+cluster_summary |>
+  filter((lower > 1 & upper > 1) | (lower < 1 & upper < 1))
+
+ggplot()+
+  geom_sf(data = clustered_data |> filter(cluster %in% c("1", "4")), 
+          aes(color = factor(cluster)), size = 3) +
+  
+  geom_sf(data = clustered_data |> filter(cluster %in% c("8")), 
+          aes(color = factor(cluster)), size = 3)
+```
+
+```{r}
+region_slopes <- fit_space_time |>
+  spread_draws(
+    b_time_s,
+    r_cluster_fct[cluster, term]
+  ) |>
+  filter(term == "time_s") |>
+  mutate(
+    slope = b_time_s + r_cluster_fct
+  ) |>
+  as_tibble()
+
+region_slopes <- region_slopes |>
+  mutate(
+    cluster = factor(cluster)
+  )
+
+
+region_summary <- region_slopes |>
+  group_by(cluster) |>
+  summarise(
+    median_slope = median(slope),
+    lower_95 = quantile(slope, 0.025),
+    upper_95 = quantile(slope, 0.975),
+    prob_negative = mean(slope < 0),
+    .groups = "drop"
+  )
+
+
+
+
+ggplot(region_slopes) +
+  geom_density_ridges(aes(
+    x = slope,
+    y = cluster
+  )) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed"
+  ) +
+  theme_ridges() +
+  labs(
+    x = "Regional temporal slope",
+    y = "Cluster"
+  )
+
+
+ggplot(
+  region_summary,
+  aes(
+    x = median_slope,
+    y = reorder(cluster, median_slope)
+  )
+) +
+  geom_errorbarh(
+    aes(
+      xmin = lower_95,
+      xmax = upper_95
+    ),
+    height = 0.2
+  ) +
+  geom_point() +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed"
+  ) +
+  labs(
+    x = "Temporal slope",
+    y = "Cluster"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+col_clus <- region_summary |>
+  mutate(col = ifelse((region_summary$lower_95 < 0 & region_summary$upper_95 <0) |
+                  (region_summary$lower_95 > 0 & region_summary$upper_95 > 0),
+                "Negative", "Zero"))
+  
+ggplot()+
+  geom_sf(data = clustered_data |>
+            right_join(col_clus |> 
+            select(cluster, col) |> 
+            mutate(cluster = as.numeric(cluster))), 
+          
+          aes(color = factor(col)))
+```
+
+## Compare slope rates between clusters
+
+```{r}
+clusters <- sort(unique(region_slopes$cluster))
+
+pairwise_slopes <- combn(
+  clusters,
+  2,
+  simplify = FALSE
+)
+
+results <- lapply(
+  pairwise_slopes,
+  function(pair) {
+    
+    tmp <- region_slopes |>
+      filter(cluster %in% pair) |>
+      select(.draw, cluster, slope) |>
+      pivot_wider(
+        names_from = cluster,
+        values_from = slope
+      )
+    
+    difference <- tmp[[as.character(pair[1])]] -
+      tmp[[as.character(pair[2])]]
+    
+    tibble(
+      cluster_1 = pair[1],
+      cluster_2 = pair[2],
+      median_difference = median(difference),
+      lower_95 = quantile(difference, 0.025),
+      upper_95 = quantile(difference, 0.975),
+      `P(Difference > 0)` = mean(difference > 0)
+    )
+  }
+) |>
+  bind_rows()
+
+results |>
+  filter((lower_95 < 0 & upper_95 < 0) | (lower_95 > 0 & upper_95 > 0)) |>
+  select(cluster_1, cluster_2, median_difference, `P(Difference > 0)`)
+```
+
+```{r}
+cluster_polygons <- clustered_data |>
+  group_by(cluster) |>
+  summarise(geometry = st_convex_hull(st_combine(geometry))) |>
+  mutate(cluster = factor(cluster))
+  
+  clustered_points <- clustered_data |>
+    full_join(results |>
+                 filter(cluster_1 == 1) |>
+                 mutate(cluster_2 = as.numeric(cluster_2)) |>
+                 rename(cluster = cluster_2))
+  
+  ggplot()+
+    geom_sf(data = cluster_polygons, aes(fill = cluster), alpha = 0.25)+
+    geom_sf(data = clustered_points, aes(col = median_difference))+
+    theme_void()
+```
+
+# Discrete Periods
+
+```{r}
+time_intervals <- c(max_age, 18000, 12000,
+                    12000, 8000, 7000, 4000, 2000, min_age)
+
+time_mean <- attr(
+  scale(fit_df$time_bin),
+  "scaled:center"
+)
+
+time_sd <- attr(
+  scale(fit_df$time_bin),
+  "scaled:scale"
+)
+
+
+
+prediction_data <- expand.grid(
+  cluster_fct = levels(fit_df$cluster_fct),
+  calBP = time_intervals
+)  |>
+  mutate(
+    time_s = (calBP - time_mean) / time_sd
+  )
+
+
+prediction_draws <- fit_space_time |>
+  epred_draws(
+    newdata = prediction_data,
+    re_formula = NULL
+  ) |>
+  rename(cluster = cluster_fct) |>
+  mutate(cluster = as.factor(cluster),
+         calBP = as.factor(calBP)) |>
+  as_tibble()
+
+
+interval_summary <- prediction_draws |>
+  group_by(cluster, calBP) |>
+  summarise(
+    median = median(.epred),
+    lower = quantile(.epred, 0.025),
+    upper = quantile(.epred, 0.975),
+    .groups = "drop"
+  )
+```
+
+```{r}
+comparison <- prediction_draws |>
+  distinct(calBP, .draw, cluster, .epred, .keep_all = TRUE) |>
+  group_by(calBP) |>
+  select(.draw, cluster, .epred) |>
+  pivot_wider(
+    names_from = cluster,
+    values_from = .epred,
+    names_prefix = "cluster_"
+  ) |>
+  mutate(calBP = as.numeric(as.character(calBP)))
+  
+
+```
+
+```{r}
+comparison |>
+  summarize(`P(Radiocarbon Intensity>0)` = 
+              mean((cluster_1) -
+                     (cluster_2) > 0)) |>
+  ggplot(
+    aes(
+      x = calBP,
+      y = `P(Radiocarbon Intensity>0)`
+    )
+  ) +
+  geom_line(
+    alpha = 0.8
+  ) +
+scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Probability that c14 intensity is greater between clusters"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+
+
+
+comparison |>
+  summarize(`P(Radiocarbon Intensity>0)` = 
+              mean((cluster_1 + cluster_6 + cluster_4) -
+                     (cluster_3 + cluster_2 + cluster_5) > 0)) |>
+  ggplot(
+    aes(
+      x = calBP,
+      y = `P(Radiocarbon Intensity>0)`
+    )
+  ) +
+  geom_line(
+    alpha = 0.8
+  ) 
+  scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Probability that c14 intensity is greater between clusters"
+  ) +
+  theme_minimal()
+
+
+comparison |>
+  summarize(`P(Radiocarbon Intensity>0)` = 
+              mean((cluster_1) - (cluster_6) > 0)) |>
+  ggplot(
+    aes(
+      x = calBP,
+      y = `P(Radiocarbon Intensity>0)`
+    )
+  ) +
+  geom_line(
+    alpha = 0.8
+  ) +
+  scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Probability that c14 intensity is greater between clusters"
+  ) +
+  theme_minimal()
+
+
+comparison |>
+  summarize(`P(Radiocarbon Intensity>0)` = 
+              mean((cluster_6) - (cluster_4) > 0)) |>
+  ggplot(
+    aes(
+      x = calBP,
+      y = `P(Radiocarbon Intensity>0)`
+    )
+  ) +
+  geom_line(
+    alpha = 0.8
+  ) +
+  scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Probability that c14 intensity is greater between clusters"
+  ) +
+  theme_minimal()
+
+
+comparison |>
+  summarize(`P(Radiocarbon Intensity>0)` = 
+              mean((cluster_1) - (cluster_3 + cluster_5) > 0)) |>
+  ggplot(
+    aes(
+      x = calBP,
+      y = `P(Radiocarbon Intensity>0)`
+    )
+  ) +
+  geom_line(
+    alpha = 0.8
+  ) +
+  scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Probability that c14 intensity is greater between clusters"
+  ) +
+  theme_minimal()
+
+comparison |>
+  summarize(`P(Radiocarbon Intensity>0)` = 
+              mean((cluster_2) - (cluster_3 + cluster_5) > 0)) |>
+  ggplot(
+    aes(
+      x = calBP,
+      y = `P(Radiocarbon Intensity>0)`
+    )
+  ) +
+  geom_line(
+    alpha = 0.8
+  ) +
+  scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Probability that c14 intensity is greater between clusters"
+  ) +
+  theme_minimal()
+```
+
+## Discrete periods by time intervals
+
+## Discrete periods by technological industries
+
+# Intensity Modeling
+
 ```{r}
 # filter by late pleistocene
 max_age <- 10000 
@@ -97,7 +772,7 @@ min_age <- 1500
 temp_res <- 500
   
 za_21ka <- za_comb |>
-  filter(c14age < max_age)
+  filter(c14age < max_age, lat != max(lat))
 
 # generate temporal grids
 time_grid <- seq(
@@ -146,16 +821,21 @@ za_21ka$y <- coords[,2]
 
 study_area <- st_bbox(sites_proj) |>
   st_as_sfc() |>
-  st_buffer(dist = 50000) |>
+  st_buffer(dist = 10000) |>
   vect()
 
 r <- rast(
   ext(study_area),
-  resolution = 10000,
+  resolution = 100000,
   crs = st_crs(sites_proj)$wkt
 )
 
 values(r) <- 1 # Gives every cell a value
+
+r <- mask(
+  r,
+  study_area
+)
 ```
 
 ```{r}
@@ -166,10 +846,12 @@ grid <- as.data.frame(
 )
 
 names(grid) <- c(
-  "cell",
   "x",
-  "y"
+  "y",
+  "cell"
 )
+
+grid$cell <- seq_len(nrow(grid))
 
 c14_sf <- st_as_sf(
   za_21ka,
@@ -263,5 +945,88 @@ fit <- brm(
   cores = 4,
   threads = threading(4),
   backend = 'cmdstanr'
+)
+```
+
+```{r}
+# scale data
+model_grid_scaled <- model_grid |>
+  mutate(x_scale = as.numeric(scale(x)),
+         y_scale = as.numeric(scale(y)),
+         time_scale = as.numeric(scale(time)))
+
+temporal_data <- model_grid_scaled |>
+  group_by(time) |>
+  summarise(
+    n_dates = sum(n_dates),
+    .groups = "drop"
+  ) |>
+  mutate(
+    time_scale = as.numeric(scale(time))
+  )
+
+
+fit_time <- brm(
+  n_dates ~
+    1 + time_scale,
+  
+  family = poisson(),
+  
+  data = temporal_data,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept"),
+    prior(normal(0, 1), class = "b")
+  ),
+  
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  
+  control = list(
+    adapt_delta = 0.95,
+    max_treedepth = 10
+  ),
+  
+  cores = 4,
+  threads = threading(4),
+  
+  backend = "cmdstanr"
+)
+```
+
+```{r}
+spatial_data <- model_grid_scaled |>
+  group_by(cell, x_scale, y_scale) |>
+  summarise(
+    n_dates = sum(n_dates),
+    .groups = "drop"
+  )
+
+fit_space <- brm(
+  n_dates ~
+    1 + gp(x_scale, y_scale, k = 5),
+  
+  family = poisson(),
+  
+  data = spatial_data,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept")
+  ),
+  
+  chains = 1,
+  iter = 2000,
+  warmup = 1000,
+  
+  control = list(
+    adapt_delta = 0.95,
+    max_treedepth = 10
+  ),
+  
+  cores = 4,
+  threads = threading(4),
+  
+  backend = "cmdstanr"
 )
 ```
