@@ -185,6 +185,103 @@ for(i in unique(za$labnr)){
 ```
 
 ```{r}
+dates_samp <- tibble(
+  site = sample(
+    unique(za_spd_df$site),
+    size = nrow(za |> distinct(Site)),
+    replace = TRUE
+  )
+) |>
+  
+  left_join(za_spd_df, 
+            by = "site", 
+            relationship = "many-to-many")
+            
+dates_samp <- dplyr::slice_sample(n = nrow(za |> 
+                                 dplyr::distinct(Site)),
+                                  za_spd_df, 
+                                  weight_by = za_spd_df$PrDens,
+                                  replace = TRUE) |>
+  dplyr::select(site, calBP)
+
+
+
+
+
+
+i = temp_res
+bin_num = seq(time_range[1], time_range[2], by = -i)
+
+
+lambda <- dates_samp |>
+  dplyr::group_by(site, calBP) |>
+  dplyr::summarize(count = dplyr::n()) |>
+  dplyr::right_join(time_range_df) |>
+  dplyr::arrange(calBP) |>
+  dplyr::mutate(count = tidyr::replace_na(count, 0)) |>
+  dplyr::mutate(
+    bin = cut(
+      calBP,
+      breaks = seq(time_range[1], time_range[2], by = -i),
+      include.lowest = TRUE
+    )
+  ) |>
+  dplyr::group_by(site, bin) |>
+  dplyr::summarize(
+    s = sum(count),
+    lower = as.numeric(unlist(regmatches(bin, gregexpr("[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?", bin))))[1],
+    upper = as.numeric(unlist(regmatches(bin, gregexpr("[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?", bin))))[2],
+    dist = abs(upper - lower),
+    rate = s / dist,
+    bin_size = i,
+    .groups = "drop"
+  ) -> za_samp
+
+
+
+local_lambda <- lambda |>
+  arrange(desc(upper)) |>
+  group_by(site, bin_size, bin, upper) |>
+  summarize(
+    local_rate = mean(rate),
+    .groups = "drop"
+  ) |>
+  arrange(desc(upper))
+
+
+# sample via poisson distribution
+n = 1
+
+i = max(local_lambda$bin_size)
+
+local_l <- local_lambda |>
+  filter(bin_size == i)
+
+count_df <- local_l |>
+  mutate(
+    count = rpois(
+      n = n(),
+      lambda = local_rate * bin_size
+    )
+  ) |>
+  dplyr::arrange(desc(upper))
+
+time_ = dplyr::tibble(calBP = seq(time_range[1], time_range[2], -i),
+                      bin_size = i)
+
+if(nrow(count_df) != nrow(time_)){
+  time_ = time_[-1,]
+}
+
+comb_df = cbind(time_, count_df)
+
+
+
+za_pois_all <- comb_df |>
+  select(-bin_size)
+```
+
+```{r}
 time_range =  c(max_age, min_age)
 time_range_df = data.frame(calBP = max_age:min_age)
 
