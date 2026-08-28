@@ -55,7 +55,7 @@ c14_za <- read_csv(paste0(dir, "/data/SARD_Mar2021_14C.csv")) |>
 
 ```{r}
 # filter by late pleistocene
-max_age <- 21000 
+max_age <- 11000 
 min_age <- 1500
 temp_res <- 100
 
@@ -135,7 +135,8 @@ for(i in unique(za$labnr)){
     
     za_terr_cal <- rcarbon::calibrate(za_terr$c14age , za_terr$c14std,
                                       calCurves = 'shcal20',
-                                      ids = za_terr$labnr)
+                                      ids = za_terr$labnr,
+                                      verbose = FALSE)
     
     }
     
@@ -152,7 +153,9 @@ for(i in unique(za$labnr)){
                                                           length(za_marine$labnr)),
                                           resOffset = rep(187, length(za_marine$labnr)),
                                           resErrors = rep(18, length(za_marine$labnr)),
-                                          ids = za_marine$labnr)
+                                          ids = za_marine$labnr,
+                                          
+                                          verbose = FALSE)
     }
     
     # combine data
@@ -212,172 +215,52 @@ dates_samp <- dplyr::slice_sample(n = nrow(za |>
 i = temp_res
 bin_num = seq(time_range[1], time_range[2], by = -i)
 
-
 lambda <- dates_samp |>
-  dplyr::group_by(site, calBP) |>
-  dplyr::summarize(count = dplyr::n()) |>
-  dplyr::right_join(time_range_df) |>
-  dplyr::arrange(calBP) |>
-  dplyr::mutate(count = tidyr::replace_na(count, 0)) |>
-  dplyr::mutate(
-    bin = cut(
-      calBP,
-      breaks = seq(time_range[1], time_range[2], by = -i),
-      include.lowest = TRUE
-    )
-  ) |>
-  dplyr::group_by(site, bin) |>
-  dplyr::summarize(
-    s = sum(count),
-    lower = as.numeric(unlist(regmatches(bin, gregexpr("[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?", bin))))[1],
-    upper = as.numeric(unlist(regmatches(bin, gregexpr("[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?", bin))))[2],
-    dist = abs(upper - lower),
-    rate = s / dist,
-    bin_size = i,
-    .groups = "drop"
-  ) -> za_samp
-
-
-
-local_lambda <- lambda |>
-  arrange(desc(upper)) |>
-  group_by(site, bin_size, bin, upper) |>
-  summarize(
-    local_rate = mean(rate),
-    .groups = "drop"
-  ) |>
-  arrange(desc(upper))
+  mutate(bin = factor(floor(calBP / i) * 100)) |>
+  group_by(bin, site) |>
+  summarize(count = replace_na(n(), 0),
+            sum_count = sum(count),
+            bin_size = temp_res,
+            local_rate = sum_count/bin_size,
+            .groups = "drop") |>
+  arrange(site, bin)
 
 
 # sample via poisson distribution
-n = 1
+iter = 10
 
 i = max(local_lambda$bin_size)
 
-local_l <- local_lambda |>
+local_l <- lambda |>
   filter(bin_size == i)
 
-count_df <- local_l |>
-  mutate(
-    count = rpois(
-      n = n(),
-      lambda = local_rate * bin_size
-    )
-  ) |>
-  dplyr::arrange(desc(upper))
 
-time_ = dplyr::tibble(calBP = seq(time_range[1], time_range[2], -i),
-                      bin_size = i)
-
-if(nrow(count_df) != nrow(time_)){
-  time_ = time_[-1,]
-}
-
-comb_df = cbind(time_, count_df)
-
-
-
-za_pois_all <- comb_df |>
-  select(-bin_size)
-```
-
-```{r}
-time_range =  c(max_age, min_age)
-time_range_df = data.frame(calBP = max_age:min_age)
-
-# Assign bins to reduce excavation biases
-target_bins = binPrep(sites = c(za_terr$Site, za_marine$Site),
-                      ages = c(za_terr$c14age, za_marine$c14age), h = 250)
-
-za_spd = spd(x = za_cal,
-              bins = target_bins, 
-              timeRange = c(max_age, min_age), 
-              datenormalised = FALSE,
-              runm = 100)
-
-za_spd_df <- as_tibble(za_spd$grid)
-
-n = 10
+count_df <- data.frame()
+for(k in 1:iter){
   
-dates_samp <- dplyr::slice_sample(n = nrow(za |> 
-                                             dplyr::distinct(Site)),
-                                  za_spd_df, 
-                                  weight_by = za_spd_df$PrDens,
-                                  replace = TRUE) |>
-  dplyr::select(calBP)
-
-i = temp_res
-bin_num = seq(time_range[1], time_range[2], by = -i)
-    
-
-lambda <- dates_samp |>
-  dplyr::group_by(calBP) |>
-  dplyr::summarize(count = dplyr::n()) |>
-  dplyr::right_join(time_range_df) |>
-  dplyr::arrange(calBP) |>
-  dplyr::mutate(count = tidyr::replace_na(count, 0)) |>
-  dplyr::mutate(
-      bin = cut(
-        calBP,
-        breaks = seq(time_range[1], time_range[2], by = -i),
-        include.lowest = TRUE
-      )
-    ) |>
-  dplyr::group_by(bin) |>
-  dplyr::summarize(
-      s = sum(count),
-      lower = as.numeric(unlist(regmatches(bin, gregexpr("[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?", bin))))[1],
-      upper = as.numeric(unlist(regmatches(bin, gregexpr("[-+]?[0-9]*\\.?[0-9]+([eE][-+]?[0-9]+)?", bin))))[2],
-      dist = abs(upper - lower),
-      rate = s / dist,
-      bin_size = i,
-      .groups = "drop"
-    ) -> za_samp
-
-    
-    
-local_lambda <- lambda |>
-  arrange(desc(upper)) |>
-  group_by(bin_size, bin, upper) |>
-  summarize(
-    local_rate = mean(rate),
-    .groups = "drop"
-  ) |>
-  arrange(desc(upper))
-
-
-# sample via poisson distribution
-n = 1
   
-i = max(local_lambda$bin_size)
-
-local_l <- local_lambda |>
-  filter(bin_size == i)
-
-  count_df <- local_l |>
-  mutate(
+  seed = seed + 1
+  set.seed(seed)
+  tmp_df <- local_l |>
+    group_by(bin, site) |>
+    mutate(
       count = rpois(
         n = n(),
         lambda = local_rate * bin_size
       )
     ) |>
-    dplyr::arrange(desc(upper))
-    
-time_ = dplyr::tibble(calBP = seq(time_range[1], time_range[2], -i),
-                      bin_size = i)
-    
-if(nrow(count_df) != nrow(time_)){
-    time_ = time_[-1,]
-  }
-    
-comb_df = cbind(time_, count_df)
-    
+    dplyr::arrange(desc(bin)) |>
+    select(bin, site, count, bin_size, local_rate)
+  
+  count_df <- rbind(count_df, tmp_df)
 
 
-za_pois_all <- comb_df |>
-  select(-bin_size)
+}
 
 
+za_pois_all <- count_df |>
+  mutate(bin = as.numeric(as.character(bin))) |>
+  rename(calBP = bin)
 ```
 
 ```{r}
@@ -392,16 +275,15 @@ za_pois_all |>
 ```
 
 ```{r}
-# convert dates to a tibble object and join the original table by lab ID
-za_comb <- za_cal |> as_tibble() |>
-  cbind(za_cal$metadata) |>
-  rename(labnr = DateID) |>
-  right_join(za)
-```
+za_comb <- za_pois_all |>
+  rename(Site = site) |>
+  left_join(za |> select(Site, lat, lon, Country, Biome, `Archaeological Period`,
+                          `Archaeological Sub-chronology`, `Province or district`,
+                          `Site Type`) |> distinct(Site, .keep_all = TRUE),
+             by = 'Site') |>
+  ungroup()
 
-# Hierarchical Modeling
 
-```{r}
 sites_sf <- st_as_sf(
   za_comb,
   coords = c("lon", "lat"),
@@ -428,21 +310,19 @@ study_area <- st_bbox(sites_proj) |>
 ```{r}
 za_holocene <- sites_proj |>
   mutate(x = st_coordinates(sites_proj)[,1],
-         y = st_coordinates(sites_proj)[,2]) |>
-  filter(c14age < max_age) 
+         y = st_coordinates(sites_proj)[,2])
 
 za_holocene |>
   group_by(`Province or district`) |>
   summarize(count = n())
-  
+
 ggplot()+
   geom_sf(data = za_holocene, aes(color = `Province or district`))
 ```
 
 ```{r}
-
 nn <- frNN(za_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
-           eps = 120000)
+           eps = 200000)
 
 hist(lengths(adjacencylist(nn)),
      xlab = "k", main="Number of Neighbors",
@@ -452,7 +332,7 @@ hist(lengths(adjacencylist(nn)),
 #nn$id[[i]]
 #nn$dist[[i]]
 #plot(za_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
-     #col = ifelse(seq_len(nrow(za_holocene)) %in% nn$id[[i]], "red", "black"))
+#col = ifelse(seq_len(nrow(za_holocene)) %in% nn$id[[i]], "red", "black"))
 
 
 
@@ -470,7 +350,7 @@ clustered_data <- za_holocene |>
   }) |>
   st_drop_geometry() |>
   
-  right_join(za_holocene, by = "Site") |>
+  full_join(za_holocene, by = "Site") |>
   st_sf()
 
 clustered_data |>
@@ -483,8 +363,8 @@ clustered_data |>
   filter(Site_ex == 1) -> site_exc
 
 #  Remove the noise cluster and clusters with too few site-specific observations
-clustered_data <- clustered_data |> filter(!(cluster %in% c(0, site_exc$cluster)))
-  
+#clustered_data <- clustered_data |> filter(!(cluster %in% c(0, site_exc$cluster)))
+
 # Explore clustered data
 ggplot()+
   geom_sf(data = clustered_data, aes(color = factor(cluster)))
@@ -497,51 +377,20 @@ time_grid <- seq(
   to = min_age,
   by = -(temp_res)
 )
-
-
-clustered_data$calBP <- unlist(
-  
-  lapply(
-    
-    1:length(clustered_data$grids),
-    
-    function(x) {
-      
-      val <- clustered_data$grids[[x]]$PrDens
-      if (length(val) == 0) return(NA)
-      
-      clustered_data$grids[[x]]$calBP[which.max(clustered_data$grids[[x]]$PrDens)]
-      
-    }
-    
-  )
-)
 ```
+
+# Hierarchical Modeling
 
 ```{r}
 fit_df <- clustered_data |>
+  rename(site_count = count) |>
+  group_by(cluster, calBP) |>
+  mutate(cluster_dates = n()) |>
+  ungroup() |>
   
-  filter(
-    calBP >= min_age,
-    calBP <= max_age
-  ) |>
-  mutate(
-    time_bin = round(calBP / temp_res) * temp_res
-    
-  ) |>
-  
-  full_join(za_pois_all |> rename(time_bin = calBP) |>
-              select(time_bin, count), by = "time_bin") 
-  
-  count(
-    cluster,
-    time_bin,
-    name = "n_dates"
-  ) |>
-  
-  mutate(time_s = as.numeric(scale(time_bin)),
-       cluster_fct = factor(cluster),
-       cluster_num = as.numeric(cluster))
+  mutate(time_s = as.numeric(scale(calBP)),
+         cluster_fct = factor(cluster),
+         cluster_num = as.numeric(cluster))
 ```
 
 ## Bayesian Modeling
@@ -550,7 +399,7 @@ fit_df <- clustered_data |>
 # Time
 seed <- seed + 1
 fit_time <- brm(
-  n_dates ~
+  cluster_dates ~
     1 + time_s,
   
   family = poisson(),
@@ -578,37 +427,8 @@ fit_time <- brm(
 
 # Space
 seed <- seed + 1
-fit_space_fct <- brm(
-  n_dates ~
-    1 + cluster_fct,
-  
-  family = poisson(),
-  
-  data = fit_df,
-  
-  prior = c(
-    prior(normal(0, 2), class = "Intercept"),
-    prior(normal(0, 1), class = "b")
-  ),
-  
-  chains = 1,
-  iter = 4000,
-  warmup = 2000,
-  
-  control = list(
-    adapt_delta = 0.95
-  ),
-  
-  cores = 4,
-  threads = threading(4),
-  backend = 'cmdstanr',
-  seed = seed
-)
-
-# Space
-seed <- seed + 1
 fit_space_h <- brm(
-  n_dates ~
+  cluster_dates ~
     1 + (1|cluster_fct),
   
   family = poisson(),
@@ -635,8 +455,8 @@ fit_space_h <- brm(
 
 # Space + Time
 seed <- seed + 1
-fit_space_time <- brm(
-  n_dates ~
+fit_space_time1 <- brm(
+  cluster_dates ~
     1 + time_s + (1|cluster_fct),
   
   family = poisson(),
@@ -664,8 +484,8 @@ fit_space_time <- brm(
 
 # Varying slope and intercept
 seed <- seed + 1
-fit_space_time <- brm(
-  n_dates ~
+fit_space_time2 <- brm(
+  cluster_dates ~
     1 + time_s + (time_s|cluster_fct),
   
   family = poisson(),
