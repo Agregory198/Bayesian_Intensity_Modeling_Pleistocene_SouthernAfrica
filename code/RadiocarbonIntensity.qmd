@@ -13,6 +13,7 @@ editor: visual
 library(ggplot2)
 library(ggridges)
 library(tidyverse)
+library(purrr)
 
 library(tidybayes)
 library(brms)
@@ -55,8 +56,8 @@ c14_za <- read_csv(paste0(dir, "/data/SARD_Mar2021_14C.csv")) |>
 
 ```{r}
 # filter by late pleistocene
-max_age <- 11000 
-min_age <- 1500
+max_age <- 21000 
+min_age <- 2000
 temp_res <- 100
 
 #filter to remove human remains as they produce errors when calibrating
@@ -188,78 +189,95 @@ for(i in unique(za$labnr)){
 ```
 
 ```{r}
-dates_samp <- tibble(
-  site = sample(
-    unique(za_spd_df$site),
-    size = nrow(za |> distinct(Site)),
+site_prob <- za_spd_df |>
+  mutate(
+    bin = floor(calBP / temp_res) * temp_res
+  ) |>
+  group_by(site, bin) |>
+  summarise(
+    prob = sum(PrDens),
+    .groups = "drop"
+  ) |>
+  complete(
+    site = unique(za_spd_df$site),
+    bin = seq(
+      floor(max_age / temp_res) * temp_res,
+      floor(min_age / temp_res) * temp_res,
+      by = -temp_res
+    ),
+    fill = list(prob = 0)
+  ) |>
+  group_by(site) |>
+  mutate(
+    p = prob / sum(prob)
+  ) |>
+  ungroup()
+
+
+
+dates_samp <- site_prob |>
+  group_by(site) |>
+  filter(sum(p) > 0) |>
+  slice_sample(
+    n = 1,
+    weight_by = p,
     replace = TRUE
+  ) |>
+  ungroup() |>
+  rename(calBP = bin)
+
+
+iter <- 1000
+seed = seed + 1
+set.seed(seed)
+
+dates_samp <- purrr::map_dfr(
+  seq_len(iter),
+  function(k) {
+    
+    site_prob |>
+      group_by(site) |>
+      filter(sum(p) > 0) |>
+      slice_sample(
+        n = 1,
+        weight_by = p,
+        replace = TRUE
+      ) |>
+      ungroup() |>
+      mutate(iter = k)
+    
+  }
+)
+
+
+
+site_counts <- site_prob |>
+  select(site, bin, p) |>
+  left_join(
+    dates_samp |>
+      count(site, bin, name = "site_count"),
+    by = c("site", "bin")
+  ) |>
+  mutate(
+    site_count = replace_na(site_count, 0)
   )
-) |>
-  
-  left_join(za_spd_df, 
-            by = "site", 
-            relationship = "many-to-many")
-            
-dates_samp <- dplyr::slice_sample(n = nrow(za |> 
-                                 dplyr::distinct(Site)),
-                                  za_spd_df, 
-                                  weight_by = za_spd_df$PrDens,
-                                  replace = TRUE) |>
-  dplyr::select(site, calBP)
 
 
+local_lambda <- site_prob |>
+  mutate(
+    lambda = iter * p,
+    local_rate = lambda / temp_res
+  )
 
 
-
-
-i = temp_res
-bin_num = seq(time_range[1], time_range[2], by = -i)
-
-lambda <- dates_samp |>
-  mutate(bin = factor(floor(calBP / i) * 100)) |>
-  group_by(bin, site) |>
-  summarize(count = replace_na(n(), 0),
-            sum_count = sum(count),
-            bin_size = temp_res,
-            local_rate = sum_count/bin_size,
-            .groups = "drop") |>
-  arrange(site, bin)
-
-
-# sample via poisson distribution
-iter = 10
-
-i = max(local_lambda$bin_size)
-
-local_l <- lambda |>
-  filter(bin_size == i)
-
-
-count_df <- data.frame()
-for(k in 1:iter){
-  
-  
-  seed = seed + 1
-  set.seed(seed)
-  tmp_df <- local_l |>
-    group_by(bin, site) |>
-    mutate(
-      count = rpois(
-        n = n(),
-        lambda = local_rate * bin_size
-      )
-    ) |>
-    dplyr::arrange(desc(bin)) |>
-    select(bin, site, count, bin_size, local_rate)
-  
-  count_df <- rbind(count_df, tmp_df)
-
-
-}
-
-
-za_pois_all <- count_df |>
-  mutate(bin = as.numeric(as.character(bin))) |>
+za_pois_all <- local_lambda |>
+  mutate(
+    count = rbinom(
+      n(),
+      size = iter,
+      prob = p
+    )
+  ) |>
   rename(calBP = bin)
 ```
 
@@ -312,17 +330,13 @@ za_holocene <- sites_proj |>
   mutate(x = st_coordinates(sites_proj)[,1],
          y = st_coordinates(sites_proj)[,2])
 
-za_holocene |>
-  group_by(`Province or district`) |>
-  summarize(count = n())
-
 ggplot()+
   geom_sf(data = za_holocene, aes(color = `Province or district`))
 ```
 
 ```{r}
 nn <- frNN(za_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
-           eps = 200000)
+           eps = 115000)
 
 hist(lengths(adjacencylist(nn)),
      xlab = "k", main="Number of Neighbors",
@@ -363,7 +377,7 @@ clustered_data |>
   filter(Site_ex == 1) -> site_exc
 
 #  Remove the noise cluster and clusters with too few site-specific observations
-#clustered_data <- clustered_data |> filter(!(cluster %in% c(0, site_exc$cluster)))
+clustered_data <- clustered_data |> filter(!(cluster %in% c(0, site_exc$cluster)))
 
 # Explore clustered data
 ggplot()+
@@ -389,49 +403,44 @@ fit_df <- clustered_data |>
   ungroup() |>
   
   mutate(time_s = as.numeric(scale(calBP)),
+         time_red = calBP/1000,
+         time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000,
+         
          cluster_fct = factor(cluster),
-         cluster_num = as.numeric(cluster))
+         cluster_num = as.numeric(cluster),
+         
+         iter = iter)
+```
+
+```{r}
+fit_df |>
+  st_drop_geometry() |>
+  
+  group_by(cluster) |>
+  distinct(Site) |>
+  summarize(count = n())
+
+
+fit_df |>
+  ggplot(aes(x = calBP, y = site_count, fill = site_count))+
+  geom_bar(stat = "identity") +
+  facet_wrap(~cluster, scale = "free") +
+  scale_fill_gradient(low = "darkorange", high = "darkblue") +
+  xlab("Calibrated Years BP")+
+  theme_minimal(base_size = 8)+
+  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
 ```
 
 ## Bayesian Modeling
 
 ```{r}
-# Time
-seed <- seed + 1
-fit_time <- brm(
-  cluster_dates ~
-    1 + time_s,
-  
-  family = poisson(),
-  
-  data = fit_df,
-  
-  prior = c(
-    prior(normal(0, 2), class = "Intercept"),
-    prior(normal(0, 1), class = "b")
-  ),
-  
-  chains = 1,
-  iter = 4000,
-  warmup = 2000,
-  
-  control = list(
-    adapt_delta = 0.95
-  ),
-  
-  cores = 4,
-  threads = threading(4),
-  backend = 'cmdstanr',
-  seed = seed
-)
-
-# Space
+# this model shows cluster show almost no variation after accounting for mean site count
 seed <- seed + 1
 fit_space_h <- brm(
-  cluster_dates ~
+  site_count ~
     1 + (1|cluster_fct),
   
-  family = poisson(),
+  family = negbinomial(),
   
   data = fit_df,
   
@@ -444,7 +453,7 @@ fit_space_h <- brm(
   warmup = 2000,
   
   control = list(
-    adapt_delta = 0.95
+    adapt_delta = 0.98
   ),
   
   cores = 4,
@@ -453,42 +462,13 @@ fit_space_h <- brm(
   seed = seed
 )
 
-# Space + Time
+
 seed <- seed + 1
-fit_space_time1 <- brm(
-  cluster_dates ~
-    1 + time_s + (1|cluster_fct),
+fit_space_h2 <- brm(
+  site_count ~
+    1 + time_ka + (1 + time_ka || cluster_fct),
   
-  family = poisson(),
-  
-  data = fit_df,
-  
-  prior = c(
-    prior(normal(0, 2), class = "Intercept")
-  ),
-  
-  chains = 1,
-  iter = 4000,
-  warmup = 2000,
-  
-  control = list(
-    adapt_delta = 0.95
-  ),
-  
-  cores = 4,
-  threads = threading(4),
-  backend = 'cmdstanr',
-  seed = seed
-)
-
-
-# Varying slope and intercept
-seed <- seed + 1
-fit_space_time2 <- brm(
-  cluster_dates ~
-    1 + time_s + (time_s|cluster_fct),
-  
-  family = poisson(),
+  family = negbinomial(),
   
   data = fit_df,
   
@@ -501,14 +481,292 @@ fit_space_time2 <- brm(
   warmup = 2000,
   
   control = list(
-    adapt_delta = 0.95
+    adapt_delta = 0.98
   ),
   
   cores = 4,
-  threads = threading(4),
+  threads = threading(8),
   backend = 'cmdstanr',
   seed = seed
 )
+```
+
+```{r}
+#get slope for all clusters
+cluster_coef <- coef(
+  fit_space_h2,
+  summary = FALSE
+)$cluster_fct
+
+
+cluster_slopes <- as.data.frame(
+  as.table(cluster_coef[, , "time_ka"])
+) |>
+  rename(
+    draw = Var1,
+    cluster = Var2,
+    slope = Freq
+  )
+
+cluster_slopes_summary <- cluster_slopes |>
+  group_by(cluster) |>
+  summarise(
+    slope = median(slope),
+    lower = quantile(slope, 0.025),
+    upper = quantile(slope, 0.975),
+    .groups = "drop"
+  )
+
+cluster_slopes_summary
+```
+
+```{r}
+# slope comparisons
+slope_draws <- as.data.frame(
+  coef(fit_space_h, summary = FALSE)$cluster_fct
+)
+
+colnames(slope_draws) <- paste0(
+  "cluster_", seq_len(ncol(slope_draws))
+)
+
+slope_pairs <- combn(
+  colnames(slope_draws),
+  2,
+  simplify = FALSE
+)
+
+pairwise_slopes <- map_dfr(
+  slope_pairs,
+  \(x) {
+    
+    diff <- slope_draws[[x[1]]] - slope_draws[[x[2]]]
+    
+    tibble(
+      cluster_1 = x[1],
+      cluster_2 = x[2],
+      difference = diff,
+      estimate = median(diff),
+      lower = quantile(diff, 0.025),
+      upper = quantile(diff, 0.975),
+      prob_cluster1_greater = mean(diff > 0)
+    )
+  }
+)
+
+# shows that no slopes are actually significantly different
+pairwise_slopes |> 
+  distinct(lower, upper, .keep_all = TRUE)
+```
+
+```{r}
+# compare at different points in time
+prediction_grid <- expand_grid(
+  calBP = seq(min_age, max_age, by = 1000),
+  cluster_fct = levels(fit_df$cluster_fct)
+) |>
+  mutate(time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000)
+
+
+pred <- fitted(
+  fit_space_h2,
+  newdata = prediction_grid,
+  re_formula = NULL,
+  summary = TRUE
+)
+
+prediction_grid <- prediction_grid |>
+  bind_cols(
+    as.data.frame(pred)
+  )
+```
+
+```{r}
+prediction_grid |>
+  filter(
+    calBP == 12000,
+    cluster_fct %in% c("3", "7")
+  )
+```
+
+```{r}
+ggplot(
+  prediction_grid |> filter(calBP > 4000),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_fct,
+    colour = cluster_fct
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_fct
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Expected site occurrence",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  theme_classic()
+```
+
+```{r}
+# COompare age ranges
+intervals <- tribble(
+  ~period, ~start, ~end,
+  "18–12 ka", 12000, 18000,
+  "12–8 ka", 8000, 12000,
+  "8–4 ka",   4000, 8000,
+  "4–2 ka",    2000,  4000
+)
+
+interval_grid <- crossing(
+  intervals,
+  cluster_fct = levels(fit_df$cluster_fct),
+  calBP = seq(2000, 18000, by = 500)
+) |>
+  filter(
+    calBP >= pmin(start, end),
+    calBP <= pmax(start, end)
+  ) |>
+  mutate(
+    time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000
+  )
+
+interval_pred <- posterior_epred(
+  fit_space_h2,
+  newdata = interval_grid,
+  re_formula = NULL
+)
+
+
+pred_long <- interval_grid |>
+  select(period, cluster_fct, calBP) |>
+  bind_cols(
+    as.data.frame(t(interval_pred))
+  ) |>
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "draw",
+    values_to = "mu"
+  )
+  
+```
+
+### Interval Summary
+
+```{r}
+# caculate expectations
+interval_summary <- pred_long |>
+  group_by(period, cluster_fct, draw) |>
+  summarise(
+    mean_count = mean(mu),
+    .groups = "drop"
+  ) |>
+  group_by(period, cluster_fct) |>
+  summarise(
+    estimate = median(mean_count),
+    lower = quantile(mean_count, 0.025),
+    upper = quantile(mean_count, 0.975),
+    .groups = "drop"
+  )
+
+
+interval_summary |>
+  ggplot()+
+  geom_bar(aes(x = cluster_fct, y = estimate), stat = "identity")+
+  facet_grid(~period) +
+  ylab('Expected radiocarbon date values')
+```
+
+### Interval rate ratio
+
+```{r}
+interval_draws <- pred_long |>
+  group_by(period, cluster_fct, draw) |>
+  summarise(
+    mean_count = mean(mu),
+    .groups = "drop"
+  )
+
+clusters <- unique(interval_draws$cluster_fct)
+
+cluster_pairs <- combn(
+  clusters,
+  2,
+  simplify = FALSE
+)
+
+interval_rate_ratios <- map_dfr(
+  cluster_pairs,
+  \(pair) {
+    
+    a <- interval_draws |>
+      filter(cluster_fct == pair[1]) |>
+      select(period, draw, count_a = mean_count)
+    
+    b <- interval_draws |>
+      filter(cluster_fct == pair[2]) |>
+      select(period, draw, count_b = mean_count)
+    
+    left_join(a, b, by = c("period", "draw")) |>
+      mutate(
+        cluster_1 = pair[1],
+        cluster_2 = pair[2],
+        rate_ratio = count_a / count_b
+      )
+  }
+)
+
+
+interval_rate_ratio_summary <- interval_rate_ratios |>
+  group_by(period, cluster_1, cluster_2) |>
+  summarise(
+    estimate = median(rate_ratio),
+    lower = quantile(rate_ratio, 0.025),
+    upper = quantile(rate_ratio, 0.975),
+    prob_greater_1 = mean(rate_ratio > 1),
+    .groups = "drop"
+  )
+
+interval_rate_ratio_summary |>
+  filter(prob_greater_1 > 0.9 | prob_greater_1 < 0.1)
+```
+
+### Within cluster change
+
+```{r}
+# temporal change within each cluster
+temporal_change <- interval_draws |>
+  #filter(period %in% c("18–12 ka", "12–8 ka", "8-4 ka", "4-2 ka")) |>
+  select(cluster_fct, period, draw, mean_count) |>
+  pivot_wider(
+    names_from = period,
+    values_from = mean_count
+  ) |>
+  mutate(
+    rate_ratio_Rob_Oak = `12–8 ka` / `18–12 ka`,
+    rate_ratio_Oak_Wilt = `8–4 ka` / `12–8 ka`,
+    rate_ratio_Wilt_Post = `4-2 ka` / `8-4 ka`
+  )
+
+temporal_change_summary <- temporal_change |>
+  group_by(cluster_fct) |>
+  summarise(
+    estimate = median(rate_ratio),
+    lower = quantile(rate_ratio, 0.025),
+    upper = quantile(rate_ratio, 0.975),
+    .groups = "drop"
+  )
 ```
 
 ```{r}
@@ -546,7 +804,7 @@ ggplot()+
 ```
 
 ```{r}
-region_slopes <- fit_space_time |>
+region_slopes <- fit_space_time2 |>
   spread_draws(
     b_time_s,
     r_cluster_fct[cluster, term]
