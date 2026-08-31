@@ -12,6 +12,8 @@ editor: visual
 # load libraries
 library(ggplot2)
 library(ggridges)
+library(ggforce)
+
 library(tidyverse)
 library(purrr)
 
@@ -25,6 +27,9 @@ library(c14bazAAR)
 
 library(sf)
 library(terra)
+library(rnaturalearth)
+library(rnaturalearthdata)
+
 library(cmdstanr)
 library(posterior)
 library(bayesplot)
@@ -51,6 +56,16 @@ c14_za <- read_csv(paste0(dir, "/data/SARD_Mar2021_14C.csv")) |>
          lon = DecdegE, lat = DecdegS,
          material = 'Material dated', species = Species) |>
   as.c14_date_list()
+
+# load the SASSI database for full ZA site locations
+sassi <- read_csv(paste0(dir, '/data/SASSI_v3.2_S1.csv')) |>
+  pivot_longer('ESA':'CeramicLSA', names_to = 'Industry', 
+               values_to = 'Presence') |>
+  mutate(Presence = ifelse(!is.na(Presence), 1, 0)) |>
+  filter((Industry %in% c('LSA', 'GenLSA', 'EarlyLSA', 'Robberg', 'Oakhurst', 
+                         'Wilton', 'FinalLSA', 'CeramicLSA')) &
+           (Presence == 1))
+
 
 ```
 
@@ -293,6 +308,8 @@ za_pois_all |>
 ```
 
 ```{r}
+###########################################
+########### ASSIGN SARD DATA ##############
 za_comb <- za_pois_all |>
   rename(Site = site) |>
   left_join(za |> select(Site, lat, lon, Country, Biome, `Archaeological Period`,
@@ -313,6 +330,7 @@ sites_proj <- st_transform(
   32734
 )
 
+
 coords <- st_coordinates(sites_proj)
 
 za_coords <- za_comb |>
@@ -323,6 +341,47 @@ study_area <- st_bbox(sites_proj) |>
   st_as_sfc() |>
   st_buffer(dist = 10000) |>
   vect()
+
+###########################################
+########### ASSIGN SASSI DATA ##############
+
+
+sassi_sf <- st_as_sf(
+  sassi,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326
+)
+
+sassi_proj <- st_transform(
+  sassi_sf,
+  32734
+)
+
+
+sassi_coords <- st_coordinates(sassi_proj)
+
+sassi_coords <- sassi |>
+  mutate(x = sassi_coords[,1],
+         y = sassi_coords[,2])
+
+sassi_area <- st_bbox(sassi_proj) |>
+  st_as_sfc() |>
+  st_buffer(dist = 10000) |>
+  vect()
+
+sassi_holocene <- sassi_proj |>
+  mutate(x = st_coordinates(sassi_proj)[,1],
+         y = st_coordinates(sassi_proj)[,2])
+
+africa_map <- ne_countries(scale = "medium", 
+                           continent = "Africa", returnclass = "sf")
+
+
+ggplot()+
+  geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
+  geom_sf(data = sassi_holocene, aes(color = Biome)) +
+  coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
+  theme_minimal()
 ```
 
 ```{r}
@@ -330,13 +389,20 @@ za_holocene <- sites_proj |>
   mutate(x = st_coordinates(sites_proj)[,1],
          y = st_coordinates(sites_proj)[,2])
 
+africa_map <- ne_countries(scale = "medium", 
+                           continent = "Africa", returnclass = "sf")
+
+
 ggplot()+
-  geom_sf(data = za_holocene, aes(color = `Province or district`))
+  geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
+  geom_sf(data = za_holocene, aes(color = `Biome`)) +
+  coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
+  theme_minimal()
 ```
 
 ```{r}
-nn <- frNN(za_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
-           eps = 115000)
+nn <- frNN(sassi_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
+           eps = 110000)
 
 hist(lengths(adjacencylist(nn)),
      xlab = "k", main="Number of Neighbors",
@@ -348,23 +414,24 @@ hist(lengths(adjacencylist(nn)),
 #plot(za_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
 #col = ifelse(seq_len(nrow(za_holocene)) %in% nn$id[[i]], "red", "black"))
 
+min_obs <- 7
 
 
-clustered_data <- za_holocene |>
+clustered_data <- sassi_holocene |>
   distinct(Site, .keep_all = TRUE) |>
   select(Site) |>
   
   mutate(cluster = {
     
     # Run DBSCAN (adjust eps and minPts to your data's scale)
-    res <- dbscan(nn, minPts = 5)
+    res <- dbscan(nn, minPts = min_obs)
     
     # Return cluster assignments (0 represents noise/outliers)
     res$cluster
   }) |>
   st_drop_geometry() |>
   
-  full_join(za_holocene, by = "Site") |>
+  full_join(sassi_holocene, by = "Site") |>
   st_sf()
 
 clustered_data |>
@@ -373,30 +440,44 @@ clustered_data |>
   filter(n_cluster < 15) |>
   group_by(Site, cluster, n_cluster) |>
   summarize(n_site = n()) |>
-  mutate(Site_ex = ifelse((n_cluster == n_site) | (n_site < 10), 1, 0)) |>
+  mutate(Site_ex = ifelse((n_cluster == n_site) | (n_site < min_obs), 1, 0)) |>
   filter(Site_ex == 1) -> site_exc
 
 #  Remove the noise cluster and clusters with too few site-specific observations
 clustered_data <- clustered_data |> filter(!(cluster %in% c(0, site_exc$cluster)))
 
+
+hulls_sf <- clustered_data |>
+  group_by(cluster) |>
+  summarize(geometry = st_combine(geometry)) |>
+  st_convex_hull()
+
 # Explore clustered data
 ggplot()+
-  geom_sf(data = clustered_data, aes(color = factor(cluster)))
-```
-
-```{r}
-# generate temporal grids
-time_grid <- seq(
-  from = max_age,
-  to = min_age,
-  by = -(temp_res)
-)
+  geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
+  #geom_sf(data = hulls_sf, aes(fill = factor(cluster)), 
+   #       alpha = 0.2, color = "black", size = 0.5) +
+  geom_sf(data = clustered_data, aes(color = factor(cluster), 
+                                     fill = factor(cluster))) +
+  geom_mark_hull(alpha = 0.2, expand = unit(3, "mm")) +
+  coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
+  theme_minimal()
 ```
 
 # Hierarchical Modeling
 
 ```{r}
-fit_df <- clustered_data |>
+# combine clustered data from SASSI to the SARD database
+df_tmp <- za_holocene |>
+  st_drop_geometry() |>
+  full_join(clustered_data |> 
+               st_drop_geometry() |> 
+               select(Site, cluster) |>
+               distinct(), by = "Site") |>
+  filter(!is.na(cluster))
+
+
+fit_df <- df_tmp |>
   rename(site_count = count) |>
   group_by(cluster, calBP) |>
   mutate(cluster_dates = n()) |>
@@ -416,7 +497,7 @@ fit_df <- clustered_data |>
 fit_df |>
   st_drop_geometry() |>
   
-  group_by(cluster) |>
+  group_by(cluster_fct) |>
   distinct(Site) |>
   summarize(count = n())
 
@@ -466,7 +547,7 @@ fit_space_h <- brm(
 seed <- seed + 1
 fit_space_h2 <- brm(
   site_count ~
-    1 + time_ka + (1 + time_ka || cluster_fct),
+    1 + time_ka + (0 + time_ka || cluster_fct),
   
   family = negbinomial(),
   
@@ -481,7 +562,7 @@ fit_space_h2 <- brm(
   warmup = 2000,
   
   control = list(
-    adapt_delta = 0.98
+    adapt_delta = 0.95
   ),
   
   cores = 4,
@@ -756,394 +837,24 @@ temporal_change <- interval_draws |>
   mutate(
     rate_ratio_Rob_Oak = `12–8 ka` / `18–12 ka`,
     rate_ratio_Oak_Wilt = `8–4 ka` / `12–8 ka`,
-    rate_ratio_Wilt_Post = `4-2 ka` / `8-4 ka`
-  )
-
-temporal_change_summary <- temporal_change |>
-  group_by(cluster_fct) |>
-  summarise(
-    estimate = median(rate_ratio),
-    lower = quantile(rate_ratio, 0.025),
-    upper = quantile(rate_ratio, 0.975),
-    .groups = "drop"
-  )
-```
-
-```{r}
-cluster_draws <- fit_space_h |>
-  spread_draws(
-    r_cluster_fct[cluster_fct, term],
-    regex = TRUE
-  )
-
-cluster_draws <- as_draws_df(fit_space_h)
-
-cluster_summary <- fit_space_h |>
-  spread_draws(
-    r_cluster_fct[cluster, term]
-  ) |>
-  filter(term == "Intercept") |>
-  group_by(cluster) |>
-  summarise(
-    mean = exp(mean(r_cluster_fct)),
-    median = exp(median(r_cluster_fct)),
-    lower = exp(quantile(r_cluster_fct, 0.025)),
-    upper = exp(quantile(r_cluster_fct, 0.975)),
-    .groups = "drop"
-  )
-
-cluster_summary |>
-  filter((lower > 1 & upper > 1) | (lower < 1 & upper < 1))
-
-ggplot()+
-  geom_sf(data = clustered_data |> filter(cluster %in% c("1", "4")), 
-          aes(color = factor(cluster)), size = 3) +
-  
-  geom_sf(data = clustered_data |> filter(cluster %in% c("8")), 
-          aes(color = factor(cluster)), size = 3)
-```
-
-```{r}
-region_slopes <- fit_space_time2 |>
-  spread_draws(
-    b_time_s,
-    r_cluster_fct[cluster, term]
-  ) |>
-  filter(term == "time_s") |>
-  mutate(
-    slope = b_time_s + r_cluster_fct
-  ) |>
-  as_tibble()
-
-region_slopes <- region_slopes |>
-  mutate(
-    cluster = factor(cluster)
-  )
-
-
-region_summary <- region_slopes |>
-  group_by(cluster) |>
-  summarise(
-    median_slope = median(slope),
-    lower_95 = quantile(slope, 0.025),
-    upper_95 = quantile(slope, 0.975),
-    prob_negative = mean(slope < 0),
-    .groups = "drop"
-  )
-
-
-
-
-ggplot(region_slopes) +
-  geom_density_ridges(aes(
-    x = slope,
-    y = cluster
-  )) +
-  geom_vline(
-    xintercept = 0,
-    linetype = "dashed"
-  ) +
-  theme_ridges() +
-  labs(
-    x = "Regional temporal slope",
-    y = "Cluster"
-  )
-
-
-ggplot(
-  region_summary,
-  aes(
-    x = median_slope,
-    y = reorder(cluster, median_slope)
-  )
-) +
-  geom_errorbarh(
-    aes(
-      xmin = lower_95,
-      xmax = upper_95
-    ),
-    height = 0.2
-  ) +
-  geom_point() +
-  geom_vline(
-    xintercept = 0,
-    linetype = "dashed"
-  ) +
-  labs(
-    x = "Temporal slope",
-    y = "Cluster"
-  ) +
-  theme_minimal()
-```
-
-```{r}
-col_clus <- region_summary |>
-  mutate(col = ifelse((region_summary$lower_95 < 0 & region_summary$upper_95 <0) |
-                  (region_summary$lower_95 > 0 & region_summary$upper_95 > 0),
-                "Negative", "Zero"))
-  
-ggplot()+
-  geom_sf(data = clustered_data |>
-            right_join(col_clus |> 
-            select(cluster, col) |> 
-            mutate(cluster = as.numeric(cluster))), 
-          
-          aes(color = factor(col)))
-```
-
-## Compare slope rates between clusters
-
-```{r}
-clusters <- sort(unique(region_slopes$cluster))
-
-pairwise_slopes <- combn(
-  clusters,
-  2,
-  simplify = FALSE
-)
-
-results <- lapply(
-  pairwise_slopes,
-  function(pair) {
-    
-    tmp <- region_slopes |>
-      filter(cluster %in% pair) |>
-      select(.draw, cluster, slope) |>
-      pivot_wider(
-        names_from = cluster,
-        values_from = slope
-      )
-    
-    difference <- tmp[[as.character(pair[1])]] -
-      tmp[[as.character(pair[2])]]
-    
-    tibble(
-      cluster_1 = pair[1],
-      cluster_2 = pair[2],
-      median_difference = median(difference),
-      lower_95 = quantile(difference, 0.025),
-      upper_95 = quantile(difference, 0.975),
-      `P(Difference > 0)` = mean(difference > 0)
-    )
-  }
-) |>
-  bind_rows()
-
-results |>
-  filter((lower_95 < 0 & upper_95 < 0) | (lower_95 > 0 & upper_95 > 0)) |>
-  select(cluster_1, cluster_2, median_difference, `P(Difference > 0)`)
-```
-
-```{r}
-cluster_polygons <- clustered_data |>
-  group_by(cluster) |>
-  summarise(geometry = st_convex_hull(st_combine(geometry))) |>
-  mutate(cluster = factor(cluster))
-  
-  clustered_points <- clustered_data |>
-    full_join(results |>
-                 filter(cluster_1 == 1) |>
-                 mutate(cluster_2 = as.numeric(cluster_2)) |>
-                 rename(cluster = cluster_2))
-  
-  ggplot()+
-    geom_sf(data = cluster_polygons, aes(fill = cluster), alpha = 0.25)+
-    geom_sf(data = clustered_points, aes(col = median_difference))+
-    theme_void()
-```
-
-# Discrete Periods
-
-```{r}
-time_intervals <- c(max_age, 18000, 12000,
-                    12000, 8000, 7000, 4000, 2000, min_age)
-
-time_mean <- attr(
-  scale(fit_df$time_bin),
-  "scaled:center"
-)
-
-time_sd <- attr(
-  scale(fit_df$time_bin),
-  "scaled:scale"
-)
-
-
-
-prediction_data <- expand.grid(
-  cluster_fct = levels(fit_df$cluster_fct),
-  calBP = time_intervals
-)  |>
-  mutate(
-    time_s = (calBP - time_mean) / time_sd
-  )
-
-
-prediction_draws <- fit_space_time |>
-  epred_draws(
-    newdata = prediction_data,
-    re_formula = NULL
-  ) |>
-  rename(cluster = cluster_fct) |>
-  mutate(cluster = as.factor(cluster),
-         calBP = as.factor(calBP)) |>
-  as_tibble()
-
-
-interval_summary <- prediction_draws |>
-  group_by(cluster, calBP) |>
-  summarise(
-    median = median(.epred),
-    lower = quantile(.epred, 0.025),
-    upper = quantile(.epred, 0.975),
-    .groups = "drop"
-  )
-```
-
-```{r}
-comparison <- prediction_draws |>
-  distinct(calBP, .draw, cluster, .epred, .keep_all = TRUE) |>
-  group_by(calBP) |>
-  select(.draw, cluster, .epred) |>
-  pivot_wider(
-    names_from = cluster,
-    values_from = .epred,
-    names_prefix = "cluster_"
-  ) |>
-  mutate(calBP = as.numeric(as.character(calBP)))
-  
-
-```
-
-```{r}
-comparison |>
-  summarize(`P(Radiocarbon Intensity>0)` = 
-              mean((cluster_1) -
-                     (cluster_2) > 0)) |>
-  ggplot(
-    aes(
-      x = calBP,
-      y = `P(Radiocarbon Intensity>0)`
-    )
-  ) +
-  geom_line(
-    alpha = 0.8
-  ) +
-scale_x_reverse() +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Probability that c14 intensity is greater between clusters"
-  ) +
-  theme_minimal()
-```
-
-```{r}
-
-
-
-comparison |>
-  summarize(`P(Radiocarbon Intensity>0)` = 
-              mean((cluster_1 + cluster_6 + cluster_4) -
-                     (cluster_3 + cluster_2 + cluster_5) > 0)) |>
-  ggplot(
-    aes(
-      x = calBP,
-      y = `P(Radiocarbon Intensity>0)`
-    )
-  ) +
-  geom_line(
-    alpha = 0.8
+    rate_ratio_Wilt_Post = `4–2 ka` / `8–4 ka`
   ) 
-  scale_x_reverse() +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Probability that c14 intensity is greater between clusters"
-  ) +
-  theme_minimal()
 
 
-comparison |>
-  summarize(`P(Radiocarbon Intensity>0)` = 
-              mean((cluster_1) - (cluster_6) > 0)) |>
-  ggplot(
-    aes(
-      x = calBP,
-      y = `P(Radiocarbon Intensity>0)`
-    )
-  ) +
-  geom_line(
-    alpha = 0.8
-  ) +
-  scale_x_reverse() +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Probability that c14 intensity is greater between clusters"
-  ) +
-  theme_minimal()
+
+temporal_change |>
+  pivot_longer('12–8 ka':'rate_ratio_Wilt_Post', 
+               names_to = 'Rates', values_to = 'Pred') |>
+  group_by(Rates) |>
+  summarise(
+    estimate = round(median(Pred), 3),
+    lower = round(quantile(Pred, 0.025), 3),
+    upper = round(quantile(Pred, 0.975), 3),
+    .groups = "drop"
+  )
 
 
-comparison |>
-  summarize(`P(Radiocarbon Intensity>0)` = 
-              mean((cluster_6) - (cluster_4) > 0)) |>
-  ggplot(
-    aes(
-      x = calBP,
-      y = `P(Radiocarbon Intensity>0)`
-    )
-  ) +
-  geom_line(
-    alpha = 0.8
-  ) +
-  scale_x_reverse() +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Probability that c14 intensity is greater between clusters"
-  ) +
-  theme_minimal()
-
-
-comparison |>
-  summarize(`P(Radiocarbon Intensity>0)` = 
-              mean((cluster_1) - (cluster_3 + cluster_5) > 0)) |>
-  ggplot(
-    aes(
-      x = calBP,
-      y = `P(Radiocarbon Intensity>0)`
-    )
-  ) +
-  geom_line(
-    alpha = 0.8
-  ) +
-  scale_x_reverse() +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Probability that c14 intensity is greater between clusters"
-  ) +
-  theme_minimal()
-
-comparison |>
-  summarize(`P(Radiocarbon Intensity>0)` = 
-              mean((cluster_2) - (cluster_3 + cluster_5) > 0)) |>
-  ggplot(
-    aes(
-      x = calBP,
-      y = `P(Radiocarbon Intensity>0)`
-    )
-  ) +
-  geom_line(
-    alpha = 0.8
-  ) +
-  scale_x_reverse() +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Probability that c14 intensity is greater between clusters"
-  ) +
-  theme_minimal()
 ```
-
-## Discrete periods by time intervals
-
-## Discrete periods by technological industries
 
 # Intensity Modeling
 
