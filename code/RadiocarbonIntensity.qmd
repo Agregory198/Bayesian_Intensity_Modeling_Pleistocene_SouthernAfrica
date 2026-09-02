@@ -409,8 +409,8 @@ df_tmp <- sassi_holocene[, 21:22] |>
   distinct()
 
 
-kNNdistplot(df_tmp, k = 3)
-abline(h = 115000, col = "red", lty = 2)
+kNNdistplot(df_tmp, k = 4)
+abline(h = 105000, col = "red", lty = 2)
 ```
 
 ```{r}
@@ -422,7 +422,7 @@ hist(lengths(adjacencylist(nn)),
      sub = paste("Neighborhood size eps =", nn$eps))
 
 
-min_obs <- 10
+min_obs <- 4
 
 
 clustered_data <- sassi_holocene |>
@@ -472,65 +472,6 @@ ggplot()+
   theme_minimal()
 ```
 
-```{r}
-nn <- frNN(sassi_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
-           eps = 115000)
-
-hist(lengths(adjacencylist(nn)),
-     xlab = "k", main="Number of Neighbors",
-     sub = paste("Neighborhood size eps =", nn$eps))
-
-
-min_obs <- 4
-
-
-clustered_data <- sassi_holocene |>
-  distinct(Site, .keep_all = TRUE) |>
-  select(Site) |>
-  
-  mutate(cluster = {
-    
-    # Run DBSCAN (adjust eps and minPts to your data's scale)
-    res <- dbscan(nn, minPts = min_obs)
-    
-    # Return cluster assignments (0 represents noise/outliers)
-    res$cluster
-  }) |>
-  st_drop_geometry() |>
-  
-  full_join(sassi_holocene, by = "Site") |>
-  st_sf()
-
-clustered_data |>
-  group_by(cluster) |>
-  mutate(n_cluster = n()) |>
-  filter(n_cluster < 15) |>
-  group_by(Site, cluster, n_cluster) |>
-  summarize(n_site = n()) |>
-  mutate(Site_ex = ifelse((n_cluster == n_site) | (n_site < min_obs), 1, 0)) |>
-  filter(Site_ex == 1) -> site_exc
-
-#  Remove the noise cluster and clusters with too few site-specific observations
-clustered_data <- clustered_data |> filter(!(cluster %in% c(0, site_exc$cluster)))
-
-
-hulls_sf <- clustered_data |>
-  group_by(cluster) |>
-  summarize(geometry = st_combine(geometry)) |>
-  st_convex_hull()
-
-# Explore clustered data
-ggplot()+
-  geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
-  #geom_sf(data = hulls_sf, aes(fill = factor(cluster)), 
-  #       alpha = 0.2, color = "black", size = 0.5) +
-  geom_sf(data = clustered_data, aes(color = factor(cluster), 
-                                     fill = factor(cluster))) +
-  geom_mark_hull(alpha = 0.2, expand = unit(3, "mm")) +
-  coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
-  theme_minimal()
-```
-
 # Hierarchical Modeling
 
 ```{r}
@@ -556,9 +497,11 @@ fit_df <- df_tmp |>
          
          cluster_fct = factor(cluster),
          cluster_num = as.numeric(cluster),
-         cluster_cat = ifelse(cluster %in% c(7, 2), 'Northwest Coast',
-                    ifelse(cluster %in% c(4, 5, 6), 'Northeast',
-                    ifelse(cluster == 3, 'Interior', 'Southern Coastal'))),
+         cluster_cat = ifelse(cluster %in% c(9, 2), 'Northwest Coast',
+                    ifelse(cluster %in% c(8, 7, 6), 'Northeast',
+                    ifelse(cluster %in% c(5), 'Interior-Karoo',
+                    ifelse(cluster %in% c(3), 'Interior-Grassland',
+                    ifelse(cluster == 4, 'East Coast', 'Southern Coast'))))),
          
          iter = iter)
 ```
@@ -864,15 +807,15 @@ pairwise_slopes |>
   # shows that no slopes are actually significantly different
   pairwise_slopes |> 
     distinct(lower, upper, .keep_all = TRUE) |>
-  filter((lower < 0 & upper < 0) | (lower > 0 & upper > 0)) |>
-    select(cluster_1, cluster_2, estimate)
+  filter(prob_cluster1_greater <= 0.1 | prob_cluster1_greater >= 0.9,
+         str_detect(cluster_1, 'ka') & str_detect(cluster_2, 'ka'))
 ```
 
 ```{r}
 # compare at different points in time
 prediction_grid <- expand_grid(
   calBP = seq(min_age, max_age, by = 1000),
-  cluster_fct = levels(fit_df$cluster_fct)
+  cluster_fct = unique(fit_df$cluster_fct)
 ) |>
   mutate(time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000)
 
@@ -881,7 +824,8 @@ pred <- fitted(
   fit_space_h2,
   newdata = prediction_grid,
   re_formula = NULL,
-  summary = TRUE
+  summary = TRUE,
+  allow_new_levels = TRUE
 )
 
 prediction_grid <- prediction_grid |>
@@ -893,11 +837,11 @@ prediction_grid <- prediction_grid |>
 prediction_grid |>
   filter(
     calBP == 12000,
-    cluster_fct %in% c("3", "7")
+    cluster_fct %in% c("3", "5")
   )
 
 ggplot(
-  prediction_grid |> filter(calBP > 4000),
+  prediction_grid |> filter(calBP > 10000),
   aes(
     x = calBP,
     y = Estimate,
@@ -959,8 +903,39 @@ prediction_grid |>
 
 ggplot(
   prediction_grid |> 
-    filter(cluster_cat %in% c('Southern Coastal', 'Interior'),
-           calBP > 11000),
+    filter(cluster_cat %in% c('Southern Coast', 'Interior-Karoo', 'Northeast')),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  theme_classic()
+
+
+
+ggplot(
+  prediction_grid |> 
+    filter(cluster_cat %in% c('Southern Coast', 'Interior-Karoo', 'Northeast'),
+           calBP > 9000),
   aes(
     x = calBP,
     y = Estimate,
@@ -1014,7 +989,8 @@ interval_grid <- crossing(
 interval_pred <- posterior_epred(
   fit_space_h2,
   newdata = interval_grid,
-  re_formula = NULL
+  re_formula = NULL,
+  allow_new_levels = TRUE
 )
 
 
@@ -1046,10 +1022,21 @@ interval_summary <- pred_long |>
 
 
 interval_summary |>
-  ggplot()+
-  geom_bar(aes(x = cluster_fct, y = estimate), stat = "identity")+
-  facet_grid(~period) +
-  ylab('Expected radiocarbon date values')
+  mutate(period = fct_relevel(period,
+                              "18–12 ka", "12–8 ka", "8–4 ka", "4–2 ka")) |>
+  
+  ggplot(aes(x = cluster_fct, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.15
+  ) +
+  facet_grid(~period, scales = "free_y") +
+  ylab("Expected radiocarbon date values") +
+  theme_minimal()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
 ###################################################
 ###################################################
 ###################################################
@@ -1087,6 +1074,7 @@ pred_long <- interval_grid |>
 # caculate expectations
 interval_summary <- pred_long |>
   group_by(period, cluster_cat, draw) |>
+  mutate(period = as.factor(period)) |> 
   summarise(
     mean_count = mean(mu),
     .groups = "drop"
@@ -1100,11 +1088,21 @@ interval_summary <- pred_long |>
   )
 
 interval_summary |>
-  ggplot()+
-  geom_bar(aes(x = cluster_cat, y = estimate), stat = "identity")+
-  facet_grid(~period, scales = "free_y") +
-  ylab('Expected radiocarbon date values') +
-  theme_minimal()
+  mutate(period = fct_relevel(period,
+                              "18–12 ka", "12–8 ka", "8–4 ka", "4–2 ka")) |>
+      
+  ggplot(aes(x = cluster_cat, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.15
+  ) +
+  facet_wrap(~period, scales = "free_y") +
+  ylab("Radiocarbon Intensity") +
+  theme_minimal()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) 
 ```
 
 ### Interval rate ratio
@@ -1205,8 +1203,8 @@ interval_rate_ratio_summary <- interval_rate_ratios |>
   group_by(period, cluster_1, cluster_2) |>
   summarise(
     estimate = median(rate_ratio),
-    lower = quantile(rate_ratio, 0.025),
-    upper = quantile(rate_ratio, 0.975),
+    lower = quantile(rate_ratio, 0.05),
+    upper = quantile(rate_ratio, 0.95),
     prob_greater_1 = mean(rate_ratio > 1),
     .groups = "drop"
   )
@@ -1245,6 +1243,37 @@ temporal_change |>
     .groups = "drop"
   )
 
+
+###########################################################
+###########################################################
+###########################################################
+
+# temporal change within each cluster
+temporal_change <- interval_draws |>
+  #filter(period %in% c("18–12 ka", "12–8 ka", "8-4 ka", "4-2 ka")) |>
+  select(cluster_cat, period, draw, mean_count) |>
+  pivot_wider(
+    names_from = period,
+    values_from = mean_count
+  ) |>
+  mutate(
+    rate_ratio_Rob_Oak = `12–8 ka` / `18–12 ka`,
+    rate_ratio_Oak_Wilt = `8–4 ka` / `12–8 ka`,
+    rate_ratio_Wilt_Post = `4–2 ka` / `8–4 ka`
+  ) 
+
+
+
+temporal_change |>
+  pivot_longer('12–8 ka':'rate_ratio_Wilt_Post', 
+               names_to = 'Rates', values_to = 'Pred') |>
+  group_by(Rates) |>
+  summarise(
+    estimate = round(median(Pred), 3),
+    lower = round(quantile(Pred, 0.025), 3),
+    upper = round(quantile(Pred, 0.975), 3),
+    .groups = "drop"
+  )
 
 ```
 
