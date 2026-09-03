@@ -38,6 +38,8 @@ library(bayesplot)
 library(dbscan)
 library(factoextra)
 
+library(akima)
+
 require(doSNOW)
 require(doParallel)
 require(doRNG)
@@ -1277,175 +1279,116 @@ temporal_change |>
 
 ```
 
-# Intensity Modeling
+# Biome modeling
 
 ```{r}
-# filter by late pleistocene
-max_age <- 10000 
-min_age <- 1500
-temp_res <- 500
-  
-za_21ka <- za_comb |>
-  filter(c14age < max_age, lat != max(lat))
-
-# generate temporal grids
-time_grid <- seq(
-  from = max_age,
-  to = min_age,
-  by = -(temp_res)
-)
+# combine clustered data from SASSI to the SARD database
+df_tmp <- za_holocene |>
+  st_drop_geometry() |>
+  full_join(clustered_data |> 
+               st_drop_geometry() |> 
+               select(Site, cluster) |>
+               distinct(), by = "Site") |>
+  filter(!is.na(cluster))
 
 
-za_21ka$calBP <- unlist(
+fit_df <- df_tmp |>
+  rename(site_count = count,
+         Site_Type = `Site Type`) |>
+  group_by(cluster, calBP) |>
+  mutate(cluster_dates = n()) |>
+  ungroup() |>
   
-  lapply(
-  
-    1:length(za_21ka$grids),
-  
-    function(x) {
-      
-      val <- za_21ka$grids[[x]]$PrDens
-      if (length(val) == 0) return(NA)
-    
-      za_21ka$grids[[x]]$calBP[which.max(za_21ka$grids[[x]]$PrDens)]
-    
-    }
-  
-  )
-)
-
+  mutate(time_s = as.numeric(scale(calBP)),
+         time_red = calBP/1000,
+         time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000,
+         
+         cluster_fct = factor(cluster),
+         cluster_num = as.numeric(cluster),
+         cluster_cat = ifelse(cluster %in% c(9, 2), 'Northwest Coast',
+                    ifelse(cluster %in% c(8, 7, 6), 'Northeast',
+                    ifelse(cluster %in% c(5), 'Interior-Karoo',
+                    ifelse(cluster %in% c(3), 'Interior-Grassland',
+                    ifelse(cluster == 4, 'East Coast', 'Southern Coast'))))),
+         
+         Site_Type = as.factor(Site_Type),
+         
+         iter = iter)
 ```
 
 ```{r}
-sites_sf <- st_as_sf(
-  za_21ka,
-  coords = c("lon", "lat"),
-  crs = 4326
-)
-
-sites_proj <- st_transform(
-  sites_sf,
-  32734
-)
- 
-coords <- st_coordinates(sites_proj)
-
-za_21ka$x <- coords[,1]
-za_21ka$y <- coords[,2]
-
-study_area <- st_bbox(sites_proj) |>
-  st_as_sfc() |>
-  st_buffer(dist = 10000) |>
-  vect()
-
-r <- rast(
-  ext(study_area),
-  resolution = 100000,
-  crs = st_crs(sites_proj)$wkt
-)
-
-values(r) <- 1 # Gives every cell a value
-
-r <- mask(
-  r,
-  study_area
-)
-```
-
-```{r}
-grid <- as.data.frame(
-  r,
-  xy = TRUE,
-  na.rm = TRUE
-)
-
-names(grid) <- c(
-  "x",
-  "y",
-  "cell"
-)
-
-grid$cell <- seq_len(nrow(grid))
-
-c14_sf <- st_as_sf(
-  za_21ka,
-  coords = c("x", "y"),
-  crs = st_crs(sites_proj)
-)
-
-grid_sf <- st_as_sf(
-  grid,
-  coords = c("x", "y"),
-  crs = st_crs(sites_proj)
-)
-
-cell_id <- st_nearest_feature(
-  c14_sf,
-  grid_sf
-)
-
-za_21ka$cell <- cell_id
-```
-
-```{r}
-model_grid <- expand_grid(
-  cell = 1:nrow(grid),
-  time = time_grid
-)
-
-model_grid <- model_grid |>
-  left_join(
-    grid |>
-      mutate(cell = row_number()),
-    by = "cell"
-  )
-```
-
-```{r}
-observations <- za_21ka |>
-  filter(
-    calBP >= min_age,
-    calBP <= max_age
-  ) |>
-  mutate(
-    time_bin = round(calBP / temp_res) * temp_res
-  ) |>
-  count(
-    cell,
-    time_bin,
-    name = "n_dates"
-  )
-
-
-
-model_grid <- model_grid |>
-  left_join(
-    observations,
-    by = c(
-      "cell",
-      "time" = "time_bin"
-    )
-  ) |>
-  mutate(
-    n_dates = replace_na(n_dates, 0)
-  )
-```
-
-```{r}
-# Run first Bayesian model to estimate lambda
-fit <- brm(
-  n_dates ~
-    1 +
-    factor(cell) +
-    factor(time),
+fit_df |>
+  st_drop_geometry() |>
   
-  family = poisson(),
+  group_by(cluster_fct) |>
+  distinct(Site) |>
+  summarize(count = n())
+
+
+fit_df |>
+  ggplot(aes(x = calBP, y = site_count, fill = site_count))+
+  geom_bar(stat = "identity") +
+  facet_wrap(~Biome, scale = "free") +
+  scale_fill_gradient(low = "darkorange", high = "darkblue") +
+  xlab("Calibrated Years BP")+
+  theme_minimal(base_size = 8)+
+  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
+
+
+fit_df |>
+  ggplot(aes(x = calBP, y = site_count, fill = site_count))+
+  geom_bar(stat = "identity") +
+  facet_wrap(~Site_Type, scale = "free") +
+  scale_fill_gradient(low = "darkorange", high = "darkblue") +
+  xlab("Calibrated Years BP")+
+  theme_minimal(base_size = 8)+
+  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
+```
+
+## Bayesian Modeling
+
+```{r}
+# this model shows cluster show almost no variation after accounting for mean site count
+seed <- seed + 1
+fit_time <- brm(
+  site_count ~
+    1 + time_ka,
   
-  data = model_grid,
+  family = negbinomial(),
+  
+  data = fit_df,
   
   prior = c(
-    prior(normal(0, 2), class = "Intercept"),
-    prior(normal(0, 1), class = "b")
+    prior(normal(0, 2), class = "Intercept")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.98
+  ),
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed
+)
+
+#######################################################
+
+seed <- seed + 1
+fit_space_biome <- brm(
+  site_count ~
+    1 + time_ka + (0 + time_ka || Biome),
+  
+  family = negbinomial(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept")
   ),
   
   chains = 1,
@@ -1457,90 +1400,896 @@ fit <- brm(
   ),
   
   cores = 4,
-  threads = threading(4),
-  backend = 'cmdstanr'
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed
 )
-```
 
-```{r}
-# scale data
-model_grid_scaled <- model_grid |>
-  mutate(x_scale = as.numeric(scale(x)),
-         y_scale = as.numeric(scale(y)),
-         time_scale = as.numeric(scale(time)))
-
-temporal_data <- model_grid_scaled |>
-  group_by(time) |>
-  summarise(
-    n_dates = sum(n_dates),
-    .groups = "drop"
-  ) |>
-  mutate(
-    time_scale = as.numeric(scale(time))
-  )
-
-
-fit_time <- brm(
-  n_dates ~
-    1 + time_scale,
+############################################################
+seed <- seed + 1
+fit_space_site_type <- brm(
+  site_count ~
+    1 + time_ka + (0 + time_ka || Site_Type),
   
-  family = poisson(),
+  family = negbinomial(),
   
-  data = temporal_data,
-  
-  prior = c(
-    prior(normal(0, 2), class = "Intercept"),
-    prior(normal(0, 1), class = "b")
-  ),
-  
-  chains = 4,
-  iter = 2000,
-  warmup = 1000,
-  
-  control = list(
-    adapt_delta = 0.95,
-    max_treedepth = 10
-  ),
-  
-  cores = 4,
-  threads = threading(4),
-  
-  backend = "cmdstanr"
-)
-```
-
-```{r}
-spatial_data <- model_grid_scaled |>
-  group_by(cell, x_scale, y_scale) |>
-  summarise(
-    n_dates = sum(n_dates),
-    .groups = "drop"
-  )
-
-fit_space <- brm(
-  n_dates ~
-    1 + gp(x_scale, y_scale, k = 5),
-  
-  family = poisson(),
-  
-  data = spatial_data,
+  data = fit_df,
   
   prior = c(
     prior(normal(0, 2), class = "Intercept")
   ),
   
   chains = 1,
-  iter = 2000,
-  warmup = 1000,
+  iter = 4000,
+  warmup = 2000,
   
   control = list(
-    adapt_delta = 0.95,
-    max_treedepth = 10
+    adapt_delta = 0.95
   ),
   
   cores = 4,
-  threads = threading(4),
-  
-  backend = "cmdstanr"
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed
 )
+```
+
+```{r}
+# compute posterior slope estimates for each cluster
+cluster_slope_draws <- spread_draws(
+  fit_space_biome,
+  r_Biome[Biome, time_ka]
+)
+
+
+cluster_slope_summary <- cluster_slope_draws |>
+  group_by(Biome) |>
+  summarise(
+    estimate = median(r_Biome),
+    lower = quantile(r_Biome, 0.05),
+    upper = quantile(r_Biome, 0.95),
+    .groups = "drop"
+  )
+
+
+
+
+draws <- as_draws_df(fit_space_biome)
+
+slope_draws <- draws |>
+  select(
+    .draw,
+    b_time_ka,
+    starts_with("r_Biome[")
+    ) |>
+  pivot_longer(
+    cols = starts_with("r_Biome["),
+    names_to = "biome",
+    values_to = "slope_deviation"
+    ) |>
+  mutate(
+    biome_slope = b_time_ka + slope_deviation,
+    biome = str_extract(biome, "(?<=\\[)[^,]+")
+    ) |>
+  group_by(biome) |>
+  summarise(
+    slope = median(biome_slope),
+    lower = quantile(biome_slope, 0.05),
+    upper = quantile(biome_slope, 0.95),
+    
+    rate_ratio_1ka = exp(slope),
+    rate_lower = exp(lower),
+    rate_upper = exp(upper),
+    
+    .groups = "drop"
+    )
+
+slope_draws
+
+##############################################################
+##############################################################
+##############################################################
+
+# compute posterior slope estimates for each cluster
+cluster_slope_draws <- spread_draws(
+  fit_space_site_type,
+  r_Site_Type[Site_Type, time_ka]
+)
+
+
+cluster_slope_summary <- cluster_slope_draws |>
+  group_by(Site_Type) |>
+  summarise(
+    estimate = median(r_Site_Type),
+    lower = quantile(r_Site_Type, 0.025),
+    upper = quantile(r_Site_Type, 0.975),
+    .groups = "drop"
+  )
+
+
+
+
+draws <- as_draws_df(fit_space_site_type)
+
+slope_draws <- draws |>
+  select(
+    .draw,
+    b_time_ka,
+    starts_with("r_Site_Type[")
+  ) |>
+  pivot_longer(
+    cols = starts_with("r_Site_Type["),
+    names_to = "site_type",
+    values_to = "slope_deviation"
+  ) |>
+  mutate(
+    site_type_slope = b_time_ka + slope_deviation,
+    site_type = str_extract(site_type, "(?<=\\[)[^,]+")
+  ) |>
+  group_by(site_type) |>
+  summarise(
+    slope = median(site_type_slope),
+    lower = quantile(site_type_slope, 0.025),
+    upper = quantile(site_type_slope, 0.975),
+    
+    rate_ratio_1ka = exp(slope),
+    rate_lower = exp(lower),
+    rate_upper = exp(upper),
+    
+    .groups = "drop"
+  )
+
+slope_draws
+```
+
+```{r}
+# slope comparisons
+slope_draws <- as.data.frame(
+  coef(fit_space_biome, summary = FALSE)$Biome
+)
+
+slope_pairs <- combn(
+  colnames(slope_draws),
+  2,
+  simplify = FALSE
+)
+
+pairwise_slopes <- map_dfr(
+  slope_pairs,
+  \(x) {
+    
+    diff <- slope_draws[[x[1]]] - slope_draws[[x[2]]]
+    
+    tibble(
+      Biome_1 = x[1],
+      Biome_2 = x[2],
+      difference = diff,
+      estimate = median(diff),
+      lower = quantile(diff, 0.025),
+      upper = quantile(diff, 0.975),
+      prob_biome1_greater = mean(diff > 0)
+    )
+  }
+)
+
+# shows that no slopes are actually significantly different
+pairwise_slopes |> 
+  distinct(lower, upper, .keep_all = TRUE) |>
+  filter((lower < 0 & upper < 0) | (lower > 0 & upper > 0),
+         str_detect(Biome_1, 'ka') & str_detect(Biome_2, 'ka'))
+  
+###############################################################################
+###############################################################################
+###############################################################################
+  
+  # slope comparisons
+  slope_draws <- as.data.frame(
+    coef(fit_space_site_type, summary = FALSE)$Site_Type
+  )
+
+  slope_pairs <- combn(
+    colnames(slope_draws),
+    2,
+    simplify = FALSE
+  )
+  
+  pairwise_slopes <- map_dfr(
+    slope_pairs,
+    \(x) {
+      
+      diff <- slope_draws[[x[1]]] - slope_draws[[x[2]]]
+      
+      tibble(
+        siteType_1 = x[1],
+        siteType_2 = x[2],
+        difference = diff,
+        estimate = median(diff),
+        lower = quantile(diff, 0.05),
+        upper = quantile(diff, 0.95),
+        prob_siteType1_greater = mean(diff > 0)
+      )
+    }
+  )
+  
+  # shows that no slopes are actually significantly different
+  pairwise_slopes |> 
+    distinct(lower, upper, .keep_all = TRUE) |>
+  filter(prob_siteType1_greater <= 0.1 | prob_siteType1_greater >= 0.9,
+         str_detect(siteType_1, 'ka') & str_detect(siteType_2, 'ka'))
+```
+
+```{r}
+# compare at different points in time
+prediction_grid <- expand_grid(
+  calBP = seq(min_age, max_age, by = 1000),
+  Biome = unique(fit_df$Biome)
+) |>
+  mutate(time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000)
+
+
+pred <- fitted(
+  fit_space_biome,
+  newdata = prediction_grid,
+  re_formula = NULL,
+  summary = TRUE,
+  allow_new_levels = TRUE
+)
+
+prediction_grid <- prediction_grid |>
+  bind_cols(
+    as.data.frame(pred)
+  )
+
+
+#prediction_grid |> filter(calBP == 12000,cluster_fct %in% c("3", "5") )
+
+ggplot(
+  prediction_grid |> filter(calBP > 12000, !is.na(Biome)),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = Biome,
+    colour = Biome
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = Biome
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Expected site occurrence",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  theme_classic()
+
+
+######################################################
+######################################################
+
+# compare at different points in time
+prediction_grid <- expand_grid(
+  calBP = seq(min_age, max_age, by = 1000),
+  cluster_cat = unique(fit_df$cluster_cat)
+) |>
+  mutate(time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000)
+
+
+pred <- fitted(
+  fit_space_h3,
+  newdata = prediction_grid,
+  re_formula = NULL,
+  summary = TRUE
+)
+
+prediction_grid <- prediction_grid |>
+  bind_cols(
+    as.data.frame(pred)
+  )
+
+
+prediction_grid |>
+  filter(
+    calBP == 12000,
+    cluster_cat %in% c("Southern Coastal", "Interior")
+  )
+
+
+
+ggplot(
+  prediction_grid |> 
+    filter(cluster_cat %in% c('Southern Coast', 'Interior-Karoo', 'Northeast')),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  theme_classic()
+
+
+
+ggplot(
+  prediction_grid |> 
+    filter(cluster_cat %in% c('Southern Coast', 'Interior-Karoo', 'Northeast'),
+           calBP > 9000),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  scale_x_reverse() +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  theme_classic()
+```
+
+```{r}
+# COompare age ranges
+intervals <- tribble(
+  ~period, ~start, ~end,
+  "18–12 ka", 12000, 18000,
+  "12–8 ka", 8000, 12000,
+  "8–4 ka",   4000, 8000,
+  "4–2 ka",    2000,  4000
+)
+
+interval_grid <- crossing(
+  intervals,
+  Biome = unique(fit_df$Biome),
+  calBP = seq(2000, 18000, by = 500)
+) |>
+  filter(
+    calBP >= pmin(start, end),
+    calBP <= pmax(start, end)
+  ) |>
+  mutate(
+    time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000
+  )
+
+interval_pred <- posterior_epred(
+  fit_space_biome,
+  newdata = interval_grid,
+  re_formula = NULL,
+  allow_new_levels = TRUE
+)
+
+
+pred_long <- interval_grid |>
+  select(period, Biome, calBP) |>
+  bind_cols(
+    as.data.frame(t(interval_pred))
+  ) |>
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "draw",
+    values_to = "mu"
+  )
+
+# caculate expectations
+interval_summary <- pred_long |>
+  group_by(period, Biome, draw) |>
+  summarise(
+    mean_count = mean(mu),
+    .groups = "drop"
+  ) |>
+  group_by(period, Biome) |>
+  summarise(
+    estimate = median(mean_count),
+    lower = quantile(mean_count, 0.05),
+    upper = quantile(mean_count, 0.95),
+    .groups = "drop"
+  ) |>
+  filter(!is.na(Biome))
+
+
+interval_summary |>
+  mutate(period = fct_relevel(period,
+                              "18–12 ka", "12–8 ka", "8–4 ka", "4–2 ka")) |>
+  
+  ggplot(aes(x = Biome, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.15
+  ) +
+  facet_wrap(~period, scales = "free_y") +
+  ylab("Expected radiocarbon date values") +
+  theme_minimal()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+###################################################
+###################################################
+###################################################
+interval_grid <- crossing(
+  intervals,
+  cluster_cat = unique(fit_df$cluster_cat),
+  calBP = seq(2000, 18000, by = 500)
+) |>
+  filter(
+    calBP >= pmin(start, end),
+    calBP <= pmax(start, end)
+  ) |>
+  mutate(
+    time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000
+  )
+
+interval_pred <- posterior_epred(
+  fit_space_h3,
+  newdata = interval_grid,
+  re_formula = NULL
+)
+
+
+pred_long <- interval_grid |>
+  select(period, cluster_cat, calBP) |>
+  bind_cols(
+    as.data.frame(t(interval_pred))
+  ) |>
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "draw",
+    values_to = "mu"
+  )
+
+# caculate expectations
+interval_summary <- pred_long |>
+  group_by(period, cluster_cat, draw) |>
+  mutate(period = as.factor(period)) |> 
+  summarise(
+    mean_count = mean(mu),
+    .groups = "drop"
+  ) |>
+  group_by(period, cluster_cat) |>
+  summarise(
+    estimate = median(mean_count),
+    lower = quantile(mean_count, 0.025),
+    upper = quantile(mean_count, 0.975),
+    .groups = "drop"
+  )
+
+interval_summary |>
+  mutate(period = fct_relevel(period,
+                              "18–12 ka", "12–8 ka", "8–4 ka", "4–2 ka")) |>
+      
+  ggplot(aes(x = cluster_cat, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.15
+  ) +
+  facet_wrap(~period, scales = "free_y") +
+  ylab("Radiocarbon Intensity") +
+  theme_minimal()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) 
+```
+
+### Interval rate ratio
+
+```{r}
+interval_draws <- pred_long |>
+  group_by(period, Biome, draw) |>
+  summarise(
+    mean_count = mean(mu),
+    .groups = "drop"
+  ) |>
+  filter(!is.na(Biome))
+
+biome <- unique(interval_draws$Biome)
+
+biome_pairs <- combn(
+  biome,
+  2,
+  simplify = FALSE
+)
+
+interval_rate_ratios <- map_dfr(
+  biome_pairs,
+  \(pair) {
+    
+    a <- interval_draws |>
+      filter(Biome == pair[1]) |>
+      select(period, draw, count_a = mean_count)
+    
+    b <- interval_draws |>
+      filter(Biome == pair[2]) |>
+      select(period, draw, count_b = mean_count)
+    
+    left_join(a, b, by = c("period", "draw")) |>
+      mutate(
+        biome_1 = pair[1],
+        biome_2 = pair[2],
+        rate_ratio = count_a / count_b
+      )
+  }
+)
+
+
+interval_rate_ratio_summary <- interval_rate_ratios |>
+  group_by(period, biome_1, biome_2) |>
+  summarise(
+    estimate = median(rate_ratio),
+    lower = quantile(rate_ratio, 0.05),
+    upper = quantile(rate_ratio, 0.95),
+    prob_greater_1 = mean(rate_ratio > 1),
+    .groups = "drop"
+  )
+
+interval_rate_ratio_summary |>
+  filter(prob_greater_1 > 0.9 | prob_greater_1 < 0.1)
+
+
+####################################################################
+####################################################################
+####################################################################
+interval_draws <- pred_long |>
+  group_by(period, cluster_cat, draw) |>
+  summarise(
+    mean_count = mean(mu),
+    .groups = "drop"
+  )
+
+clusters <- unique(interval_draws$cluster_cat)
+
+cluster_pairs <- combn(
+  clusters,
+  2,
+  simplify = FALSE
+)
+
+interval_rate_ratios <- map_dfr(
+  cluster_pairs,
+  \(pair) {
+    
+    a <- interval_draws |>
+      filter(cluster_cat == pair[1]) |>
+      select(period, draw, count_a = mean_count)
+    
+    b <- interval_draws |>
+      filter(cluster_cat == pair[2]) |>
+      select(period, draw, count_b = mean_count)
+    
+    left_join(a, b, by = c("period", "draw")) |>
+      mutate(
+        cluster_1 = pair[1],
+        cluster_2 = pair[2],
+        rate_ratio = count_a / count_b
+      )
+  }
+)
+
+
+interval_rate_ratio_summary <- interval_rate_ratios |>
+  group_by(period, cluster_1, cluster_2) |>
+  summarise(
+    estimate = median(rate_ratio),
+    lower = quantile(rate_ratio, 0.05),
+    upper = quantile(rate_ratio, 0.95),
+    prob_greater_1 = mean(rate_ratio > 1),
+    .groups = "drop"
+  )
+
+interval_rate_ratio_summary |>
+  filter(prob_greater_1 > 0.90 | prob_greater_1 < 0.10)
+```
+
+# Spatiotemporal
+
+```{r}
+fit_df <- za_holocene |>
+  rename(site_count = count,
+         Site_Type = `Site Type`) |>
+  
+  mutate(time_red = calBP/1000,
+         time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000,
+         time_s = as.numeric(scale(calBP, center = TRUE, scale = TRUE)),
+         
+         lat_s = as.numeric(scale(y), center = TRUE, scale = TRUE),
+         lon_s = as.numeric(scale(x), center = TRUE, scale = TRUE),
+         
+         Site_Type = as.factor(Site_Type),
+         
+         iter = iter) |>
+  filter(!is.na(lat_s) & !is.na(lon_s))
+```
+
+```{r}
+
+#seed <- seed + 1
+seed <- 28
+fit_spatiotemporal <- brm(
+  site_count ~
+    1 +
+    time_s +
+    gp(lon_s, lat_s),
+  
+  family = negbinomial(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed
+)
+
+#seed <- seed + 1
+seed <- 29
+fit_spatiotemporal2 <- brm(
+  site_count ~
+    1 +
+    time_s +
+    gp(lon_s, lat_s) +
+    gp(lon_s, lat_s, by = time_s),
+  
+  family = negbinomial(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed
+)
+```
+
+```{r}
+lon_center <- mean(fit_df$x)
+lon_scale  <- sd(fit_df$x)
+
+lat_center <- mean(fit_df$y)
+lat_scale  <- sd(fit_df$y)
+
+time_center <- mean(fit_df$calBP)
+time_scale  <- sd(fit_df$calBP)
+
+
+prediction_grid <- expand_grid(
+  lon_s = seq(min(fit_df$lon_s), max(fit_df$lon_s),
+              length.out = 20),
+  lat_s = seq(min(fit_df$lat_s), max(fit_df$lat_s),
+              length.out = 20),
+  time_s = seq(min(fit_df$time_s), max(fit_df$time_s),
+               length.out = 10),
+) |>
+  mutate(
+    lon = (lon_s * lon_scale) + lon_center,
+    lat = (lat_s * lat_scale) + lat_center,
+    
+    calBP = time_s * time_scale + time_center
+  )
+
+prediction_sf <- st_as_sf(
+  prediction_grid,
+  coords = c("lon", "lat"),
+  crs = 4326,
+  remove = FALSE)
+
+xy <- st_coordinates(prediction_sf)
+
+prediction_grid <- prediction_sf |>
+  st_drop_geometry() |>
+  mutate(
+    x = xy[, 1],
+    y = xy[, 2]
+  )
+
+post_pred <- posterior_epred(
+  fit_spatiotemporal,
+  newdata = prediction_grid,
+  re_formula = NA
+)
+
+prediction_grid <- prediction_grid |>
+  mutate(
+    estimate = apply(post_pred, 2, median),
+    lower = apply(post_pred, 2, quantile, probs = 0.05),
+    upper = apply(post_pred, 2, quantile, probs = 0.95)
+  )
+```
+
+```{r}
+southern_africa_utm <- st_transform(
+  africa_map,
+  crs = 32735   # replace with the UTM CRS you're using
+)
+
+
+ggplot() +
+  
+  geom_raster(data = prediction_grid |> 
+                filter(calBP == 2000) |> 
+                mutate(estimate = as.numeric(log(estimate))),
+              aes(x = lon, y = lat, fill = estimate)) +
+  
+  geom_sf(
+    data = southern_africa_utm,
+    fill = NA,
+    color = "black",
+    linewidth = 0.4
+  )  +
+  
+  scale_fill_viridis_c() +
+  coord_sf(expand = FALSE) +
+  theme_minimal()
+
+ggplot() +
+  geom_sf(
+    data = southern_africa_utm,
+    fill = NA,
+    color = "black",
+    linewidth = 0.4
+  ) +
+  geom_sf(data = za_holocene, aes(color = `Biome`)) +
+  scale_fill_viridis_c()
+
+ggplot() +
+  geom_sf(data = southern_africa_utm, fill = "grey90", color = "grey40")+
+  coord_sf(xlim = c(min(za_holocene$x), max(za_holocene$x)), ylim = c(min(za_holocene$y), max(za_holocene$y)), expand = FALSE) +
+  theme_minimal()
+```
+
+```{r}
+pred_summary <- pred_long |>
+  group_by(lon, lat, calBP) |>
+  summarise(
+    estimate = median(radiocarbon_rate),
+    lower = quantile(radiocarbon_rate, 0.05),
+    upper = quantile(radiocarbon_rate, 0.95),
+    .groups = "drop"
+  ) |>
+  filter(!is.na(lon))
+
+
+pred_sf <- st_as_sf(
+  pred_summary,
+  coords = c("lon", "lat"),
+  crs = 32734
+) |>
+  st_transform(
+    crs = 4326
+  )
+
+pred_coord <- pred_sf |>
+  mutate(
+    lon = st_coordinates(pred_sf)[,1],
+    lat = st_coordinates(pred_sf)[,2]
+  ) 
+
+
+ggplot()+
+  geom_sf(data = pred_coord, aes(x = lon, y = lat))
+
+
+ggplot() +
+  geom_sf(data = africa_map, fill = "grey90", color = "grey40") +
+  
+  geom_raster(data = pred_coord, aes(x = lon, y = lat, fill = estimate)) 
+  
+  coord_sf() +
+  scale_fill_viridis_c() +
+  theme_minimal()
+```
+
+```{r}
+interp_surface <- interp(x = pred_coord$lon, y = pred_coord$lat, 
+                        z = pred_coord$estimate, duplicate = 'mean')
+
+surface_df <- expand.grid(
+  lon = interp_surface$x,
+  lat = interp_surface$y
+) |>
+  mutate(estimate = as.vector(interp_surface$z))
+
+ggplot() +
+  geom_sf(data = africa_map, fill = "grey90", color = "grey40") +
+  geom_raster(
+    data = surface_df,
+    aes(
+      x = lon,
+      y = lat,
+      fill = estimate
+    )
+  ) +
+  coord_sf()
+
+
+
+
+
+# 3. Convert the interpolated matrix back to a data frame for ggplot
+continuous_surface <- expand.grid(lon = spline_interp$x, lat = spline_interp$y)
+continuous_surface$value <- as.vector(spline_interp$z)
+continuous_surface <- na.omit(continuous_surface)
+
+
+ggplot() +
+  geom_sf(data = africa_map, fill = "grey90", color = "grey40")+
+  geom_raster(data = continuous_surface,  aes(x = lon, y = lat, fill = value),
+              interpolate = TRUE) +
+  coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE)
+  
+  
+
+```
+
+```{r}
+ggplot()+
+geom_sf(
+  data = africa_map,
+  fill = "grey90",
+  color = "grey40"
+)
+  
+  
+  coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE)
 ```
