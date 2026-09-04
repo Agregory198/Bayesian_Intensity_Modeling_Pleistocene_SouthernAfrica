@@ -1285,31 +1285,12 @@ temporal_change |>
 # combine clustered data from SASSI to the SARD database
 df_tmp <- za_holocene |>
   st_drop_geometry() |>
-  full_join(clustered_data |> 
-               st_drop_geometry() |> 
-               select(Site, cluster) |>
-               distinct(), by = "Site") |>
-  filter(!is.na(cluster))
-
-
-fit_df <- df_tmp |>
-  rename(site_count = count,
-         Site_Type = `Site Type`) |>
-  group_by(cluster, calBP) |>
-  mutate(cluster_dates = n()) |>
   ungroup() |>
+  rename(Site_Type = 'Site Type') |>
   
   mutate(time_s = as.numeric(scale(calBP)),
          time_red = calBP/1000,
-         time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000,
-         
-         cluster_fct = factor(cluster),
-         cluster_num = as.numeric(cluster),
-         cluster_cat = ifelse(cluster %in% c(9, 2), 'Northwest Coast',
-                    ifelse(cluster %in% c(8, 7, 6), 'Northeast',
-                    ifelse(cluster %in% c(5), 'Interior-Karoo',
-                    ifelse(cluster %in% c(3), 'Interior-Grassland',
-                    ifelse(cluster == 4, 'East Coast', 'Southern Coast'))))),
+         time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000,,
          
          Site_Type = as.factor(Site_Type),
          
@@ -1317,13 +1298,6 @@ fit_df <- df_tmp |>
 ```
 
 ```{r}
-fit_df |>
-  st_drop_geometry() |>
-  
-  group_by(cluster_fct) |>
-  distinct(Site) |>
-  summarize(count = n())
-
 
 fit_df |>
   ggplot(aes(x = calBP, y = site_count, fill = site_count))+
@@ -2036,6 +2010,70 @@ fit_df <- za_holocene |>
          
          iter = iter) |>
   filter(!is.na(lat_s) & !is.na(lon_s))
+
+
+
+```
+
+```{r}
+get_ig_params <- function(min_dist, max_dist, tail_prob = 0.01) {
+  # Solves for inverse-gamma(shape, rate) such that:
+  #   P(X < min_dist) = tail_prob
+  #   P(X > max_dist) = tail_prob
+  # This bounds the GP lengthscale prior between the smallest meaningful
+  # distance in your data and the largest, avoiding boundary collapse.
+  
+  target <- function(par) {
+    shape <- exp(par[1])  # exponentiate to keep search unconstrained but shape>0
+    rate  <- exp(par[2])
+    
+    p_low  <- pinvgamma(min_dist, shape, rate)
+    p_high <- 1 - pinvgamma(max_dist, shape, rate)
+    
+    # squared error against target tail probabilities
+    (p_low - tail_prob)^2 + (p_high - tail_prob)^2
+  }
+  
+  # inverse-gamma CDF via base R's gamma CDF (since 1/X ~ Gamma(shape, rate))
+  pinvgamma <- function(x, shape, rate) {
+    1 - pgamma(1 / x, shape = shape, rate = rate)
+  }
+  environment(target) <- environment()  # ensure pinvgamma is visible inside target
+  
+  # reasonable starting guess: shape=2, rate=min_dist (rough heuristic)
+  init <- log(c(2, min_dist))
+  
+  opt <- optim(
+    par = init,
+    fn = target,
+    method = "Nelder-Mead",
+    control = list(reltol = 1e-12, maxit = 5000)
+  )
+  
+  shape <- exp(opt$par[1])
+  rate  <- exp(opt$par[2])
+  
+  # quick diagnostic printout
+  cat(sprintf(
+    "shape = %.4f, rate = %.4f\nP(X < %.4f) = %.4f\nP(X > %.4f) = %.4f\n",
+    shape, rate,
+    min_dist, pinvgamma(min_dist, shape, rate),
+    max_dist, pinvgamma(max_dist, shape, rate)
+  ))
+  
+  list(shape = shape, rate = rate)
+}
+```
+
+```{r}
+# find min/max pairwise distances in your standardized coords first
+d <- as.matrix(dist(fit_df[, c("lon_s","lat_s")] |> 
+                      st_drop_geometry() |> 
+                      distinct()))
+diag(d) <- NA
+min_d <- min(d, na.rm=TRUE); max_d <- max(d, na.rm=TRUE)
+
+ig <- get_ig_params(min_d, max_d)
 ```
 
 ```{r}
@@ -2053,10 +2091,12 @@ fit_spatiotemporal <- brm(
   data = fit_df,
   
   prior = c(
-    prior(normal(0, 2), class = "Intercept")
+    prior(normal(0, 2), class = "Intercept"),
+    prior(exponential(2), class = "sdgp"),
+    prior(lognormal(log(1.5), 0.5), class = "lscale")
   ),
   
-  chains = 1,
+  chains = 2,
   iter = 4000,
   warmup = 2000,
   
@@ -2084,7 +2124,13 @@ fit_spatiotemporal2 <- brm(
   data = fit_df,
   
   prior = c(
-    prior(normal(0, 2), class = "Intercept")
+    prior(normal(0, 2), class = "Intercept"),
+    
+    prior(exponential(2), class = "sdgp", coef = "gplon_slat_s"),
+    prior(exponential(2), class = "sdgp", coef = "gplon_slat_stime_s"),
+    
+    prior(lognormal(log(1), 0.4), class = "lscale", coef = "gplon_slat_s"),
+    prior(lognormal(log(1.5), 0.4), class = "lscale", coef = "gplon_slat_stime_s")
   ),
   
   chains = 1,
@@ -2100,6 +2146,42 @@ fit_spatiotemporal2 <- brm(
   backend = 'cmdstanr',
   seed = seed
 )
+
+####################
+seed <- 30
+fit_spatiotemporal3 <- brm(
+  site_count ~
+    1 +
+    gp(lon_s, lat_s, k = 20, c = 5/4)+
+    gp(time_s, k = 20, c = 5/4),
+  
+  family = negbinomial(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept"),
+    
+    prior(exponential(2), class = "sdgp", coef = "gplon_slat_s"),
+    prior(exponential(2), class = "sdgp", coef = "gptime_s"),
+    
+    prior(inv_gamma(0.51, 0.00059), class = "lscale", coef = "gplon_slat_s")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed
+)
+
 ```
 
 ```{r}
@@ -2167,8 +2249,7 @@ southern_africa_utm <- st_transform(
 ggplot() +
   
   geom_raster(data = prediction_grid |> 
-                filter(calBP == 2000) |> 
-                mutate(estimate = as.numeric(log(estimate))),
+                filter(calBP == 2000),
               aes(x = lon, y = lat, fill = estimate)) +
   
   geom_sf(
@@ -2197,6 +2278,180 @@ ggplot() +
   coord_sf(xlim = c(min(za_holocene$x), max(za_holocene$x)), ylim = c(min(za_holocene$y), max(za_holocene$y)), expand = FALSE) +
   theme_minimal()
 ```
+
+## Modeling by time
+
+```{r}
+# Spatial extent of your data
+lon_range <- range(fit_df$x, na.rm = TRUE)
+lat_range <- range(fit_df$y, na.rm = TRUE)
+
+# Create a dense regular grid
+pred_grid <- expand_grid(
+  lon = seq(lon_range[1], lon_range[2], length.out = 50),
+  lat = seq(lat_range[1], lat_range[2], length.out = 50)
+)
+
+lon_mean <- mean(fit_df$x)
+lon_sd  <- sd(fit_df$x)
+
+lat_mean <- mean(fit_df$y)
+lat_sd  <- sd(fit_df$y)
+
+time_mean <- mean(fit_df$calBP)
+time_sd  <- sd(fit_df$calBP)
+
+pred_grid <- pred_grid |>
+  mutate(
+    lon_s = (lon - lon_mean) / lon_sd,
+    lat_s = (lat - lat_mean) / lat_sd,
+    
+    chunk = ceiling(row_number() / 1000)
+  )
+
+times <- c(
+  20000, 18000, 16000, 14000, 12000,
+  10000, 8000, 6000, 4000, 2000
+)
+
+pred_grid <- crossing(
+  pred_grid,
+  calBP = times
+) |>
+  mutate(
+    time_s = (calBP - time_mean) / time_sd
+  )
+
+
+
+prediction_sf <- st_as_sf(
+  pred_grid,
+  coords = c("lon", "lat"),
+  crs = 4326,
+  remove = FALSE)
+
+xy <- st_coordinates(prediction_sf)
+
+pred_grid <- prediction_sf |>
+  st_drop_geometry() |>
+  mutate(
+    lon = xy[, 1],
+    lat = xy[, 2]
+  )
+
+
+pred_chunks <- lapply(
+  unique(pred_grid$chunk),
+  function(i) {
+    
+    message("Predicting chunk ", i, " of ",
+            max(pred_grid$chunk))
+    
+    nd <- pred_grid |>
+      filter(chunk == i)
+    
+    epred <- posterior_epred(
+      fit_spatiotemporal2,
+      newdata = nd,
+      re_formula = NA,
+      ndraws = 500
+    )
+    
+    nd |>
+      mutate(
+        estimate = apply(epred, 2, median),
+        lower = apply(epred, 2, quantile, probs = 0.05),
+        upper = apply(epred, 2, quantile, probs = 0.95)
+      )
+  }
+)
+
+pred_summary <- bind_rows(pred_chunks)
+
+```
+
+```{r}
+
+southern_africa <- ne_countries(
+  scale = "medium",
+  returnclass = "sf"
+) |>
+  filter(
+    admin %in% c(
+      "South Africa",
+      "Namibia",
+      "Botswana",
+      "Zimbabwe",
+      "Mozambique",
+      "Eswatini",
+      "Lesotho",
+      "Zambia",
+      "Malawi"
+    )
+  ) |>
+  st_union()
+
+pred_sf <- st_as_sf(
+  pred_summary,
+  coords = c("lon", "lat"),
+  crs = 4326
+)
+
+
+pred_sf <- pred_sf[
+  st_within(pred_sf, southern_africa, sparse = FALSE),
+]
+
+```
+
+```{r}
+ggplot() +
+  
+  geom_raster(
+    data = pred_summary,
+    aes(
+      x = lon,
+      y = lat,
+      fill = estimate
+    )
+  ) +
+  
+  geom_sf(
+    data = southern_africa,
+    fill = NA,
+    color = "black",
+    linewidth = 0.4
+  ) +
+  
+  coord_sf(
+    xlim = range(pred_summary$lon),
+    ylim = range(pred_summary$lat),
+    expand = FALSE
+  ) +
+  
+  scale_fill_viridis_c(
+    name = "Predicted\nsite intensity"
+  ) +
+  
+  theme_minimal()
+
+ggplot(pred_summary) +
+  geom_raster(
+    aes(
+      x = lon,
+      y = lat,
+      fill = estimate
+    )
+  ) +
+  scale_fill_viridis_c(
+    trans = scales::log10_trans(),
+    name = "Predicted\nsite intensity"
+  ) +
+  coord_fixed() +
+  theme_minimal()
+```
+
+# Junk
 
 ```{r}
 pred_summary <- pred_long |>
