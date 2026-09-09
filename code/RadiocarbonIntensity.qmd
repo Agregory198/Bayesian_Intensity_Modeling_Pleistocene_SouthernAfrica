@@ -13,6 +13,7 @@ editor: visual
 library(ggplot2)
 library(ggridges)
 library(ggforce)
+library(ggpubr)
 
 library(tidyverse)
 library(purrr)
@@ -374,17 +375,39 @@ sassi_area <- st_bbox(sassi_proj) |>
 
 sassi_holocene <- sassi_proj |>
   mutate(x = st_coordinates(sassi_proj)[,1],
-         y = st_coordinates(sassi_proj)[,2])
+         y = st_coordinates(sassi_proj)[,2],
+         
+         Industry = as.factor(ifelse(Industry == 'CeramicLSA', 
+                           'Ceramic Final Later Stone Age',
+                    ifelse(Industry == 'FinalLSA', 'Final Later Stone Age',
+                           Industry))),
+         
+         Industry = fct_relevel(Industry, c('Robberg', 'Oakhurst',
+                                            'Wilton', 'Final Later Stone Age',
+                                            'Ceramic Final Later Stone Age')))
 
 africa_map <- ne_countries(scale = "medium", 
                            continent = "Africa", returnclass = "sf")
 
 
+png("map1.png", width = 1200, height = 800, res = 300)
+
 ggplot()+
   geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
-  geom_sf(data = sassi_holocene, aes(color = Biome)) +
+  geom_sf(data = sassi_holocene  |>
+            filter(Industry != 'GenLSA', Industry != 'LSA'),
+          aes(color = Biome), size = 0.45) +
+  facet_wrap(~Industry)+
   coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
-  theme_minimal()
+  theme_minimal() +
+  theme(axis.text = element_text(size = 3),
+        axis.title = element_text(size = 3),
+        strip.text = element_text(size = 4),
+        
+        legend.title = element_text(size = 5),
+        legend.text = element_text(size = 4))
+
+dev.off()
 ```
 
 ```{r}
@@ -462,75 +485,68 @@ hulls_sf <- clustered_data |>
   summarize(geometry = st_combine(geometry)) |>
   st_convex_hull()
 
+
+png("map2.png", width = 1200, height = 800, res = 300)
 # Explore clustered data
 ggplot()+
   geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
   #geom_sf(data = hulls_sf, aes(fill = factor(cluster)), 
    #       alpha = 0.2, color = "black", size = 0.5) +
-  geom_sf(data = clustered_data, aes(color = factor(cluster), 
-                                     fill = factor(cluster))) +
+  geom_sf(data = clustered_data, aes(color = factor(cluster)), size = 0.45) +
   geom_mark_hull(alpha = 0.2, expand = unit(3, "mm")) +
+  scale_color_discrete(name = "Cluster",
+                       labels = c(
+                         '1' = '1 - Southern Coast',
+                         
+                         '2' = '2 - Northwest Coast',
+                         '9' = '9 - Northwest Coast',
+                         
+                         '3' = '3 - Interior Grassland',
+                         
+                         '4' = '4 - East Coast',
+                         
+                         '5' = '5 - Interior Karoo',
+                         
+                         '6' = '6 - Northeast',
+                         '7' = '7 - Northeast',
+                         '8' = '8 - Northeast'
+                       )) +
   coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
-  theme_minimal()
+  theme_minimal()+
+  theme(axis.text = element_text(size = 3),
+        axis.title = element_text(size = 3),
+        strip.text = element_text(size = 4),
+        
+        legend.title = element_text(size = 5),
+        legend.text = element_text(size = 4))
+
+dev.off()
 ```
 
 # Hierarchical Modeling
 
 ```{r}
-# combine clustered data from SASSI to the SARD database
-df_tmp <- za_holocene |>
+
+fit_df <- za_holocene |>
   st_drop_geometry() |>
-  full_join(clustered_data |> 
-               st_drop_geometry() |> 
-               select(Site, cluster) |>
-               distinct(), by = "Site") |>
-  filter(!is.na(cluster))
-
-
-fit_df <- df_tmp |>
-  rename(site_count = count) |>
-  group_by(cluster, calBP) |>
-  mutate(cluster_dates = n()) |>
+  rename(site_count = count,
+         Tech = `Archaeological Sub-chronology`) |>
   ungroup() |>
   
   mutate(time_s = as.numeric(scale(calBP)),
          time_red = calBP/1000,
-         time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000,
+         time_ka = -(calBP - mean(calBP, na.rm = TRUE))/1000,
          
-         cluster_fct = factor(cluster),
-         cluster_num = as.numeric(cluster),
-         cluster_cat = ifelse(cluster %in% c(9, 2), 'Northwest Coast',
-                    ifelse(cluster %in% c(8, 7, 6), 'Northeast',
-                    ifelse(cluster %in% c(5), 'Interior-Karoo',
-                    ifelse(cluster %in% c(3), 'Interior-Grassland',
-                    ifelse(cluster == 4, 'East Coast', 'Southern Coast'))))),
+         Tech = ifelse(str_detect(Tech, 'Iron'), 'Ceramic LSA', Tech),
          
-         iter = iter)
-```
-
-```{r}
-fit_df |>
-  st_drop_geometry() |>
-  
-  group_by(cluster_fct) |>
-  distinct(Site) |>
-  summarize(count = n())
+         iter = iter) |>
+  filter(Tech != 'ELSA', Tech != 'Final MSA')
 
 
 fit_df |>
   ggplot(aes(x = calBP, y = site_count, fill = site_count))+
   geom_bar(stat = "identity") +
-  facet_wrap(~cluster, scale = "free") +
-  scale_fill_gradient(low = "darkorange", high = "darkblue") +
-  xlab("Calibrated Years BP")+
-  theme_minimal(base_size = 8)+
-  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
-
-
-fit_df |>
-  ggplot(aes(x = calBP, y = site_count, fill = site_count))+
-  geom_bar(stat = "identity") +
-  facet_wrap(~cluster_cat, scale = "free") +
+  facet_wrap(~Tech, scale = "free") +
   scale_fill_gradient(low = "darkorange", high = "darkblue") +
   xlab("Calibrated Years BP")+
   theme_minimal(base_size = 8)+
@@ -540,40 +556,13 @@ fit_df |>
 ## Bayesian Modeling
 
 ```{r}
+
 # this model shows cluster show almost no variation after accounting for mean site count
-seed <- seed + 1
+#seed <- seed + 1
+seed <- 8
 fit_time <- brm(
   site_count ~
     1 + time_ka,
-  
-  family = negbinomial(),
-  
-  data = fit_df,
-  
-  prior = c(
-    prior(normal(0, 2), class = "Intercept")
-  ),
-  
-  chains = 1,
-  iter = 4000,
-  warmup = 2000,
-  
-  control = list(
-    adapt_delta = 0.98
-  ),
-  
-  cores = 4,
-  threads = threading(8),
-  backend = 'cmdstanr',
-  seed = seed
-)
-
-#######################################################
-
-seed <- seed + 1
-fit_space_h2 <- brm(
-  site_count ~
-    1 + time_ka + (0 + time_ka || cluster_fct),
   
   family = negbinomial(),
   
@@ -597,8 +586,384 @@ fit_space_h2 <- brm(
   seed = seed
 )
 
+seed <- 9
+fit_time2 <- brm(
+  site_count ~
+    1 + time_ka + (1  + time_ka | Tech),
+  
+  family = negbinomial(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed
+)
+
+
+```
+
+# Results
+
+## Hypotheses
+
+### $H_1$:  ***Rates of radiocarbon intensity vary between archaeological sites in southern Africa.***
+
+### $H_2$: ***Periods that correspond to the technological industries will show different rates of radiocarbon intensity based on varying population sizes.***
+
+#### $H_{2a}$: The period associated with Robberg technology will show reduced radiocarbon intensity compared with the Oakhurst, Wilton, and Post-Wilton technological periods.
+
+#### $H_{2b}$: The period associated with Oakhurst technology should show higher radiocarbon intensity rates than the Robberg technological period.
+
+#### $H_{2c}$: The period associated with Wilton technology should show lower radiocarbon intensity rates than the Oakhurst technological period.
+
+#### $H_{2D}$: The period associated with Post-Wilton technology should show higher radiocarbon intensity rates than the Wilton technological period.
+
+### $H_3$: ***Radiocarbon intensity for technological periods associated with greater population sizes will have regional-distinct patterns but will be regionally similar during periods with low population sizes.***
+
+#### $H_{3a}$: During the Robberg period, regional radiocarbon intensity will be similar across southern Africa.
+
+#### $H_{3B}$: During the Oakhurst period, regional radiocarbon intensity will be different across southern Africa.
+
+#### $H_{3C}$: During the Wilton period, regional radiocarbon intensity will be similar across southern Africa.
+
+#### $H_{3D}$: During the Post-Wilton period, regional radiocarbon intensity will be different across southern Africa.
+
+## Results
+
+### 1) Do rates of radiocarbon intensity vary through time in southern Africa?
+
+Yes, the radiocarbon intensity increases exponentially towards the present. The mean rate is 0.96 for Robberg period, 9.63 for the Oakhurst period, 31.4 for the WIlton period, and 78.5 for the Final LSA period.
+
+```{r}
+# compute posterior slope estimates for the first model including time
+time_mean <- mean(fit_df$calBP, na.rm = TRUE)
+
+prediction_grid <- expand_grid(
+  calBP = seq(min_age, max_age, by = 1000)
+) |>
+  mutate(time_ka = -(calBP - time_mean)/1000)
+
+
+
+draws <- posterior_epred(
+  fit_time,
+  newdata = prediction_grid
+  ) |>
+  as_tibble() |>
+  rename_with(
+    .fn = ~ paste0(unique(prediction_grid$calBP)),
+    .cols = starts_with('V')
+  ) |>
+  pivot_longer(
+    cols = '2000':'21000',
+    values_to = 'estimate',
+    names_to = 'time'
+  ) |>
+  mutate(time = as.numeric(time)) |>
+  group_by(time) |>
+  
+  summarise(
+    slope = median(estimate),
+    lower = quantile(estimate, 0.05),
+    upper = quantile(estimate, 0.95),
+    
+    .groups = "drop"
+  )
+```
+
+```{r}
+draws |>
+  ggplot(aes(x = time, y = slope)) +
+  geom_smooth(method = "loess", se = TRUE, span = 0.75) +
+  scale_x_reverse() +
+  
+  annotate("rect", xmin = 19923, xmax = 13145, ymin = -Inf, ymax = Inf,
+           fill = "blue", alpha = 0.2) +
+  annotate("text", x = (19923+13145)/2, y = 25, label = "Robberg", 
+           color = "blue", fontface = "bold", vjust = -0.5) +
+  
+  annotate("rect", xmin = 12789, xmax = 8705, ymin = -Inf, ymax = Inf,
+           fill = "forestgreen", alpha = 0.2) +
+  annotate("text", x = (12789+8705)/2, y = 25, label = "Oakhurst", 
+            color = "forestgreen", fontface = "bold", vjust = -0.5) +
+  
+  annotate("rect", xmin = 7784, xmax = 4636, ymin = -Inf, ymax = Inf,
+           fill = "orange", alpha = 0.2) +
+  annotate("text", x = (7784+4636)/2, y = 25, label = "Wilton", 
+            color = "orange", fontface = "bold", vjust = -0.5) +
+  
+  annotate("rect", xmin = 3898, xmax = 1318, ymin = -Inf, ymax = Inf,
+           fill = "gold", alpha = 0.2) +
+  annotate("text", x = (3898+1318)/2, y = 19, label = "Final Later\nStone Age", 
+            color = "gold", fontface = "bold", vjust = -0.5) +
+  
+  
+  ylab("Rate of Radiocarbon Intesnity/1,000 years") +
+  xlab("Time (yrs cal BP)") +
+  theme_minimal()
+```
+
+### 2) Do rates of radiocarbon intensity vary through time and technological classification in southern Africa?
+
+No, a pairwise comparison shows that the assigned technological classes do not change through time within southern Africa. This is likely because the actual classifications begin prior to and after the proposed temporal interval Lombard et al. (2022) assigned.
+
+```{r}
+# compute posterior slope estimates for each cluster
+time_mean <- mean(fit_df$calBP, na.rm = TRUE)
+
+prediction_grid <- expand_grid(
+  calBP = seq(min_age, max_age, by = 1000),
+  Tech = unique(fit_df$Tech)
+) |>
+  mutate(time_ka = -(calBP - time_mean)/1000) |>
+  filter(!is.na(Tech))
+
+draws <- posterior_epred(
+  fit_time2,
+  newdata = prediction_grid
+)  |>
+  as_tibble() |>
+  rename_with(
+    .fn = ~ unique(paste0(prediction_grid$calBP, "_", 
+                          prediction_grid$Tech)),
+    .cols = starts_with('V')
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    values_to = 'estimate',
+    names_to = 'time'
+  ) |>
+  separate_wider_delim(
+    cols = time, 
+    delim = "_", 
+    names = c("time", "tech")
+  ) |>
+  mutate(time = as.numeric(time)) |>
+  group_by(time, tech) |>
+  
+  summarise(
+    slope = median(estimate),
+    lower = quantile(estimate, 0.05),
+    upper = quantile(estimate, 0.95),
+    
+    .groups = "drop"
+  ) 
+
+# examine the radiocarbon rate by technology
+draws_tech <- posterior_epred(
+  fit_time2,
+  newdata = prediction_grid
+)  |>
+  as_tibble() |>
+  rename_with(
+    .fn = ~ unique(paste0(prediction_grid$calBP, "_", 
+                          prediction_grid$Tech)),
+    .cols = starts_with('V')
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    values_to = 'estimate',
+    names_to = 'time'
+  ) |>
+  separate_wider_delim(
+    cols = time, 
+    delim = "_", 
+    names = c("time", "tech")
+  ) |>
+  mutate(time = as.numeric(time),
+         tech = as.factor(tech)) |>
+  group_by(tech) |>
+  
+  summarise(
+    slope = median(estimate),
+    lower = quantile(estimate, 0.05),
+    upper = quantile(estimate, 0.95),
+    
+    .groups = "drop"
+  ) 
+
+
+# examine the radiocarbon rate by period
+draws_period <- posterior_epred(
+  fit_time2,
+  newdata = prediction_grid
+)  |>
+  as_tibble() |>
+  rename_with(
+    .fn = ~ unique(paste0(prediction_grid$calBP, "_", 
+                          prediction_grid$Tech)),
+    .cols = starts_with('V')
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    values_to = 'estimate',
+    names_to = 'time'
+  ) |>
+  separate_wider_delim(
+    cols = time, 
+    delim = "_", 
+    names = c("time", "tech")
+  ) |>
+  mutate(time = as.numeric(time),
+         
+         period = ifelse(time > 13000, 'Robberg',
+                         ifelse(time > 8000, 'Oakhurst',
+                                ifelse(time > 4000, 'Wilton',
+                                       ifelse(time > 1300, 'Final LSA',
+                                              'Ceramic LSA')))),
+         tech = factor(tech)) |>
+  group_by(period) |>
+  
+  summarise(
+    slope = median(estimate),
+    lower = quantile(estimate, 0.05),
+    upper = quantile(estimate, 0.95),
+    
+    .groups = "drop"
+  ) 
+
+# examine the radiocarbon rate bewtween time period and tehnology
+
+draws_tech_period <- posterior_epred(
+  fit_time2,
+  newdata = prediction_grid
+)  |>
+  as_tibble() |>
+  rename_with(
+    .fn = ~ unique(paste0(prediction_grid$calBP, "_", 
+                          prediction_grid$Tech)),
+    .cols = starts_with('V')
+  ) |>
+  pivot_longer(
+    cols = everything(),
+    values_to = 'estimate',
+    names_to = 'time'
+  ) |>
+  separate_wider_delim(
+    cols = time, 
+    delim = "_", 
+    names = c("time", "tech")
+  ) |>
+  mutate(time = as.numeric(time),
+         
+         period = ifelse(time > 13000, 'Robberg',
+                         ifelse(time > 8000, 'Oakhurst',
+                                ifelse(time > 4000, 'Wilton',
+                                       ifelse(time > 1300, 'Final LSA',
+                                              'Ceramic LSA')))),
+         tech = factor(tech)) |>
+  group_by(tech, period) |>
+  
+  summarise(
+    slope = median(estimate),
+    lower = quantile(estimate, 0.05),
+    upper = quantile(estimate, 0.95),
+    
+    .groups = "drop"
+  ) 
+
+
+
+```
+
+```{r}
+ep <- posterior_epred(
+  fit_time2,
+  newdata = prediction_grid
+) |> 
+  as_tibble() |>
+  mutate(draw = row_number()) |>
+  pivot_longer(
+    cols = -draw,
+    names_to = "pred_id",
+    values_to = "estimate"
+  ) |>
+  mutate(
+    pred_id = as.integer(sub("V", "", pred_id)),
+    time = prediction_grid$calBP[pred_id],
+    tech = prediction_grid$Tech[pred_id]
+  ) |>
+  mutate(
+    time = as.numeric(time),
+    tech = factor(tech)
+  ) |>
+  pivot_wider(
+    id_cols = c(draw, time),
+    names_from = tech,
+    values_from = estimate
+  )
+
+# Evaluate the probability that the radiocarbon intensity rates are different between technological classifications
+ep |>
+  summarize(`Robberg > Oakhurst` = mean(Robberg > Oakhurst),
+            `Oakhurst > Wilton` = mean(Oakhurst > Wilton),
+            `Wilton > Final LSA` = mean(Wilton > `Final LSA`),
+            
+            `Robberg > Wilton` = mean(Robberg > `Wilton`))
+```
+
+### 3) Do different technological periods correspond to different radiocarbon intensities across southern African regions?
+
+Yes, of particular interest is the fact that the interior-karoo radiocarbon intensity increases into the later Holocene, suggesting a continuous occupation of this region during the middle and later Holocene despoit previous predictions. However, the pattern is much different when we consider the radiocarbon intensity associated to sites assigned to distinct technological classifications.
+
+In particular, though the interior-karoo was significantly different between the Robberg and Oakhurst period (19 ka cal BP - 8.7 ka cal BP), there is no significant difference bewteen radiocarbon intensity and the sites that show Robberg and Oakhurst technologies. However, Wilton technology has a higher rate of radiocarbon intensity within the interior-karoo, implying greater population around sites associated with wilton technology in the interior-karoo. The final LSA also has a lower rate in the interior-karoo than does wilton technology. Given the graphic, this is the general trend for all of southern Africa.
+
+**In conclusion, the technological patterns show homogeneous patterns through southern Africa whereas the temporal trends show significant differences across southern Africa.** Each period shows a monotonic increase in radriocarbon intensity through time, but Africa is regionally distinct over specific periods of time but the technological trends do not track these differences.
+
+```{r}
+# combine clustered data from SASSI to the SARD database
+df_tmp <- za_holocene |>
+  st_drop_geometry() |>
+  full_join(clustered_data |> 
+              st_drop_geometry() |> 
+              select(Site, cluster) |>
+              distinct(), by = "Site") |>
+  filter(!is.na(cluster))
+
+
+fit_df <- df_tmp |>
+  rename(site_count = count,
+         Tech = `Archaeological Sub-chronology`) |>
+  group_by(cluster, calBP) |>
+  mutate(cluster_dates = n()) |>
+  ungroup() |>
+  
+  mutate(time_s = as.numeric(scale(calBP)),
+         time_red = calBP/1000,
+         time_ka = -(calBP - mean(calBP, na.rm = TRUE))/1000,
+         
+         cluster_fct = factor(cluster),
+         cluster_num = as.numeric(cluster),
+         cluster_cat = ifelse(cluster %in% c(9, 2), 'Northwest Coast',
+                              ifelse(cluster %in% c(8, 7, 6), 'Northeast',
+                                     ifelse(cluster %in% c(5), 'Interior-Karoo',
+                                            ifelse(cluster %in% c(3), 'Interior-Grassland',
+                                                   ifelse(cluster == 4, 'East Coast', 'Southern Coast'))))),
+         
+         Tech = ifelse(str_detect(Tech, 'Iron'), 'Ceramic LSA', Tech),
+         
+         iter = iter) |>
+  filter(Tech != 'ELSA', Tech != 'Final MSA')
+```
+
+```{r}
 ############################################################
-seed <- seed + 1
+#seed <- seed + 1
+seed <- 10
 fit_space_h3 <- brm(
   site_count ~
     1 + time_ka + (0 + time_ka || cluster_cat),
@@ -624,82 +989,136 @@ fit_space_h3 <- brm(
   backend = 'cmdstanr',
   seed = seed
 )
+
+
+############################################################
+#seed <- seed + 1
+seed <- 11
+fit_space_h4 <- brm(
+  site_count ~
+    1 + time_ka + (1 + time_ka | Tech) + (0 + time_ka || cluster_cat),
+  
+  family = negbinomial(),
+  
+  data = fit_df,
+  
+  prior = c(
+    prior(normal(0, 2), class = "Intercept")
+  ),
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  control = list(
+    adapt_delta = 0.95
+  ),
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed
+)
 ```
 
 ```{r}
-# compute posterior slope estimates for each cluster
-cluster_slope_draws <- spread_draws(
-  fit_space_h2,
-  r_cluster_fct[cluster_fct, time_ka]
-)
+# Compare age ranges
+intervals <- tribble(
+  ~period, ~start, ~end,
+  "Robberg", 13145, 19923,
+  "Oakhurst",   8705, 12789,
+  "Wilton",    4636,  7784,
+  "Final LSA", 1318, 3898
+) |>
+  mutate(period = as.factor(period),
+         period = fct_relevel(period, c('Robberg', 'Oakhurst', 'Wilton',
+                                        'Final LSA')))
 
 
-cluster_slope_summary <- cluster_slope_draws |>
-  group_by(cluster_fct) |>
-  summarise(
-    estimate = median(r_cluster_fct),
-    lower = quantile(r_cluster_fct, 0.025),
-    upper = quantile(r_cluster_fct, 0.975),
-    .groups = "drop"
-  )
+time_mean <- mean(fit_df$calBP, na.rm = TRUE)
 
-
-
-
-draws <- as_draws_df(fit_space_h2)
-
-slope_draws <- draws |>
-  select(
-    .draw,
-    b_time_ka,
-    starts_with("r_cluster_fct[")
-    ) |>
-  pivot_longer(
-    cols = starts_with("r_cluster_fct["),
-    names_to = "cluster",
-    values_to = "slope_deviation"
-    ) |>
+interval_grid <- crossing(
+  intervals,
+  cluster_cat = unique(fit_df$cluster_cat),
+  calBP = seq(1000, 21000, by = 500)
+) |>
+  filter(
+    calBP >= pmin(start, end),
+    calBP <= pmax(start, end)
+  ) |>
   mutate(
-    cluster_slope = b_time_ka + slope_deviation,
-    cluster = str_extract(cluster, "(?<=\\[)[^,]+")
-    ) |>
-  group_by(cluster) |>
-  summarise(
-    slope = median(cluster_slope),
-    lower = quantile(cluster_slope, 0.025),
-    upper = quantile(cluster_slope, 0.975),
-    
-    rate_ratio_1ka = exp(slope),
-    rate_lower = exp(lower),
-    rate_upper = exp(upper),
-    
-    .groups = "drop"
-    )
+    time_ka = -(calBP - time_mean)/1000
+  )
 
-slope_draws
-
-##############################################################
-##############################################################
-##############################################################
-
-# compute posterior slope estimates for each cluster
-cluster_slope_draws <- spread_draws(
+interval_pred <- posterior_epred(
   fit_space_h3,
-  r_cluster_cat[cluster_cat, time_ka]
+  newdata = interval_grid,
+  re_formula = NULL
 )
 
 
-cluster_slope_summary <- cluster_slope_draws |>
-  group_by(cluster_cat) |>
+pred_long <- interval_grid |>
+  select(period, cluster_cat, calBP) |>
+  bind_cols(
+    as.data.frame(t(interval_pred))
+  ) |>
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "draw",
+    values_to = "mu"
+  )
+
+# caculate expectations
+interval_summary <- pred_long |>
+  group_by(period, cluster_cat, draw) |>
+  mutate(period = as.factor(period)) |> 
   summarise(
-    estimate = median(r_cluster_cat),
-    lower = quantile(r_cluster_cat, 0.025),
-    upper = quantile(r_cluster_cat, 0.975),
+    mean_count = mean(mu),
+    .groups = "drop"
+  ) |>
+  group_by(period, cluster_cat) |>
+  summarise(
+    estimate = median(mean_count),
+    lower = quantile(mean_count, 0.05),
+    upper = quantile(mean_count, 0.95),
     .groups = "drop"
   )
 
+interval_summary |>
+  
+  ggplot(aes(x = cluster_cat, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.15
+  ) +
+  facet_wrap(~period, scales = "free_y") +
+  ylab("Radiocarbon Intensity") +
+  xlab("Regional Aggregate") +
+  theme_minimal()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) 
 
 
+interval_summary |>
+  
+  ggplot(aes(x = period, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.15
+  ) +
+  facet_wrap(~cluster_cat, scales = "free_y") +
+  ylab("Radiocarbon Intensity") +
+  xlab("Regional Aggregate") +
+  theme_minimal()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) 
+```
+
+```{r}
 
 draws <- as_draws_df(fit_space_h3)
 
@@ -717,35 +1136,11 @@ slope_draws <- draws |>
   mutate(
     cluster_slope = b_time_ka + slope_deviation,
     cluster = str_extract(cluster, "(?<=\\[)[^,]+")
-  ) |>
-  group_by(cluster) |>
-  summarise(
-    slope = median(cluster_slope),
-    lower = quantile(cluster_slope, 0.025),
-    upper = quantile(cluster_slope, 0.975),
-    
-    rate_ratio_1ka = exp(slope),
-    rate_lower = exp(lower),
-    rate_upper = exp(upper),
-    
-    .groups = "drop"
-  )
+  )  
 
-slope_draws
-```
-
-```{r}
-# slope comparisons
-slope_draws <- as.data.frame(
-  coef(fit_space_h2, summary = FALSE)$cluster_fct
-)
-
-colnames(slope_draws) <- paste0(
-  "cluster_", seq_len(ncol(slope_draws))
-)
 
 slope_pairs <- combn(
-  colnames(slope_draws),
+  unique(slope_draws$cluster),
   2,
   simplify = FALSE
 )
@@ -754,64 +1149,249 @@ pairwise_slopes <- map_dfr(
   slope_pairs,
   \(x) {
     
-    diff <- slope_draws[[x[1]]] - slope_draws[[x[2]]]
+    diff <- slope_draws |>
+      filter(cluster %in% x) |>
+      select(.draw, cluster, cluster_slope) |>
+      pivot_wider(
+        names_from = cluster,
+        values_from = cluster_slope
+      ) |>
+      mutate(
+        difference = .data[[x[1]]] - .data[[x[2]]]
+      ) |>
+      pull(difference)
     
     tibble(
       cluster_1 = x[1],
       cluster_2 = x[2],
-      difference = diff,
       estimate = median(diff),
       lower = quantile(diff, 0.025),
       upper = quantile(diff, 0.975),
-      prob_cluster1_greater = mean(diff > 0)
+      prob_cluster1_greater = mean(diff > 0),
+      
+      # optional: ratio of temporal rate multipliers
+      rate_ratio = median(exp(diff)),
+      rate_ratio_lower = quantile(exp(diff), 0.025),
+      rate_ratio_upper = quantile(exp(diff), 0.975)
     )
   }
 )
 
-# shows that no slopes are actually significantly different
-pairwise_slopes |> 
-  distinct(lower, upper, .keep_all = TRUE) |>
-  filter((lower < 0 & upper < 0) | (lower > 0 & upper > 0))
-  
-###############################################################################
-###############################################################################
-###############################################################################
-  
-  # slope comparisons
-  slope_draws <- as.data.frame(
-    coef(fit_space_h3, summary = FALSE)$cluster_cat
+pairwise_slopes |>
+  filter(lower > 0 | upper < 0)
+```
+
+```{r}
+# Compare age ranges
+intervals <- tribble(
+  ~period, ~start, ~end,
+  "Robberg", 13145, 19923,
+  "Oakhurst",   8705, 12789,
+  "Wilton",    4636,  7784,
+  "Final LSA", 1318, 3898
+) |>
+  mutate(period = as.factor(period),
+         period = fct_relevel(period, c('Robberg', 'Oakhurst', 'Wilton',
+                                        'Final LSA')))
+
+
+time_mean <- mean(fit_df$calBP, na.rm = TRUE)
+
+interval_grid <- crossing(
+  intervals,
+  cluster_cat = unique(fit_df$cluster_cat),
+  Tech = unique(fit_df$Tech),
+  calBP = seq(1000, 21000, by = 500)
+) |>
+  filter(
+    calBP >= pmin(start, end),
+    calBP <= pmax(start, end)
+  ) |>
+  mutate(
+    time_ka = -(calBP - time_mean)/1000
   )
 
-  slope_pairs <- combn(
-    colnames(slope_draws),
-    2,
-    simplify = FALSE
+interval_pred <- posterior_epred(
+  fit_space_h4,
+  newdata = interval_grid,
+  re_formula = NULL
+)
+
+
+pred_long <- interval_grid |>
+  select(cluster_cat, Tech, calBP) |>
+  bind_cols(
+    as.data.frame(t(interval_pred))
+  ) |>
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "draw",
+    values_to = "mu"
   )
-  
-  pairwise_slopes <- map_dfr(
-    slope_pairs,
-    \(x) {
-      
-      diff <- slope_draws[[x[1]]] - slope_draws[[x[2]]]
-      
-      tibble(
-        cluster_1 = x[1],
-        cluster_2 = x[2],
-        difference = diff,
-        estimate = median(diff),
-        lower = quantile(diff, 0.025),
-        upper = quantile(diff, 0.975),
-        prob_cluster1_greater = mean(diff > 0)
-      )
-    }
+
+# caculate expectations
+interval_summary <- pred_long |>
+  group_by(Tech, cluster_cat, draw) |>
+  mutate(Tech = as.factor(Tech)) |> 
+  summarise(
+    mean_count = mean(mu),
+    .groups = "drop"
+  ) |>
+  group_by(Tech, cluster_cat) |>
+  summarise(
+    estimate = median(mean_count),
+    lower = quantile(mean_count, 0.05),
+    upper = quantile(mean_count, 0.95),
+    .groups = "drop"
   )
+
+interval_summary |>
   
-  # shows that no slopes are actually significantly different
-  pairwise_slopes |> 
-    distinct(lower, upper, .keep_all = TRUE) |>
-  filter(prob_cluster1_greater <= 0.1 | prob_cluster1_greater >= 0.9,
-         str_detect(cluster_1, 'ka') & str_detect(cluster_2, 'ka'))
+  ggplot(aes(x = Tech, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.15
+  ) +
+  facet_wrap(~cluster_cat, scales = "free") +
+  ylab("Radiocarbon Intensity") +
+  xlab("Regional Aggregate") +
+  theme_minimal()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) 
 ```
+
+```{r}
+draws <- as_draws_df(fit_space_h4)
+
+
+cluster_slopes <- draws |>
+  select(
+    .draw,
+    starts_with("r_cluster_cat[")
+  ) |>
+  pivot_longer(
+    cols = starts_with("r_cluster_cat["),
+    names_to = "cluster",
+    values_to = "cluster_deviation"
+  ) |>
+  mutate(
+    cluster = 
+      str_extract(cluster, "(?<=\\[)[^,]+"),
+  ) |>
+  select(.draw, cluster, cluster_deviation)
+
+tech_slopes <- draws |>
+  select(
+    .draw,
+    matches("^r_Tech\\[.*,time_ka\\]$")
+  ) |>
+  pivot_longer(
+    cols = -.draw,
+    names_to = "Tech",
+    values_to = "tech_deviation"
+  ) |>
+  mutate(
+    Tech = 
+      str_extract(Tech, "(?<=\\[)[^,]+")
+  ) |>
+  select(.draw, Tech, tech_deviation)
+
+
+fixed_slope <- draws |>
+  select(.draw, b_time_ka)
+
+slope_draws <- cluster_slopes |>
+  left_join(
+    tech_slopes,
+    by = ".draw",
+    relationship = "many-to-many"
+  ) |>
+  left_join(
+    fixed_slope,
+    by = ".draw"
+  ) |>
+  mutate(
+    cluster_tech = paste(cluster, Tech, sep = "_"),
+    cluster_slope =
+      b_time_ka +
+      cluster_deviation +
+      tech_deviation
+  )
+
+
+slope_pairs <- combn(
+  unique(slope_draws$cluster_tech),
+  2,
+  simplify = FALSE
+)
+
+
+slope_pair_comp <- tibble(
+  combination_1 = character(),
+  combination_2 = character(),
+  estimate = numeric(),
+  lower = numeric(),
+  upper = numeric(),
+  prob_1_greater = numeric(),
+  rate_ratio = numeric(),
+  rate_ratio_lower = numeric(),
+  rate_ratio_upper = numeric()
+)
+for(i in slope_pairs){
+  
+
+    
+    wide <- slope_draws |>
+      filter(
+        cluster_tech %in% i
+      ) |>
+      select(.draw, cluster_tech, cluster_slope) |>
+      mutate(
+        cluster_tech = as.character(cluster_tech)
+      ) |>
+      pivot_wider(
+        id_cols = .draw,
+        names_from = cluster_tech,
+        values_from = cluster_slope
+      )
+    
+    diff <- wide[,2] - wide[,3]
+    
+    tmp_tib <- tibble(
+      combination_1 = i[1],
+      combination_2 = i[2],
+      estimate = median(diff[[1]]),
+      lower = quantile(diff[[1]], 0.05),
+      upper = quantile(diff[[1]], 0.95),
+      prob_1_greater = mean(diff[[1]] > 0),
+      rate_ratio = median(exp(diff[[1]])),
+      rate_ratio_lower = quantile(exp(diff[[1]]), 0.05),
+      rate_ratio_upper = quantile(exp(diff[[1]]), 0.95)
+    )
+    
+    slope_pair_comp <- slope_pair_comp |>
+      add_row(tmp_tib)
+}
+```
+
+```{r}
+# Track interior karoo rates across technologicl classifications
+slope_pair_comp |>
+  filter(str_detect(combination_1, 'Karoo') & 
+           str_detect(combination_2, 'Karoo')) |>
+  select(combination_1:combination_2, rate_ratio:rate_ratio_upper)
+
+
+# Track southern coast rates across technologicl classifications
+slope_pair_comp |>
+  filter(str_detect(combination_1, 'Southern') & 
+           str_detect(combination_2, 'Southern')) |>
+  select(combination_1:combination_2, rate_ratio:rate_ratio_upper)
+```
+
+# Junks
 
 ```{r}
 # compare at different points in time
@@ -819,7 +1399,7 @@ prediction_grid <- expand_grid(
   calBP = seq(min_age, max_age, by = 1000),
   cluster_fct = unique(fit_df$cluster_fct)
 ) |>
-  mutate(time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000)
+  mutate(time_ka = -(calBP - mean(calBP, na.rm = TRUE))/1000)
 
 
 pred <- fitted(
@@ -836,11 +1416,6 @@ prediction_grid <- prediction_grid |>
   )
 
 
-prediction_grid |>
-  filter(
-    calBP == 12000,
-    cluster_fct %in% c("3", "5")
-  )
 
 ggplot(
   prediction_grid |> filter(calBP > 10000),
@@ -875,11 +1450,16 @@ ggplot(
 ######################################################
 
 # compare at different points in time
+
+
+
+
+
 prediction_grid <- expand_grid(
   calBP = seq(min_age, max_age, by = 1000),
   cluster_cat = unique(fit_df$cluster_cat)
 ) |>
-  mutate(time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000)
+  mutate(time_ka = -(calBP - time_mean)/1000)
 
 
 pred <- fitted(
@@ -895,17 +1475,11 @@ prediction_grid <- prediction_grid |>
   )
 
 
-prediction_grid |>
-  filter(
-    calBP == 12000,
-    cluster_cat %in% c("Southern Coastal", "Interior")
-  )
-
-
 
 ggplot(
   prediction_grid |> 
-    filter(cluster_cat %in% c('Southern Coast', 'Interior-Karoo', 'Northeast')),
+    filter(cluster_cat %in% c('Southern Coast', 'Interior-Karoo'),
+           calBP > 8000),
   aes(
     x = calBP,
     y = Estimate,
@@ -923,69 +1497,40 @@ ggplot(
     colour = NA
   ) +
   geom_line(linewidth = 1) +
-  scale_x_reverse() +
   labs(
     x = "Calendar age (cal BP)",
     y = "Radiocarbon Intensity",
     colour = "Cluster",
     fill = "Cluster"
   ) +
-  theme_classic()
-
-
-
-ggplot(
-  prediction_grid |> 
-    filter(cluster_cat %in% c('Southern Coast', 'Interior-Karoo', 'Northeast'),
-           calBP > 9000),
-  aes(
-    x = calBP,
-    y = Estimate,
-    group = cluster_cat,
-    colour = cluster_cat
-  )
-) +
-  geom_ribbon(
-    aes(
-      ymin = Q2.5,
-      ymax = Q97.5,
-      fill = cluster_cat
-    ),
-    alpha = 0.15,
-    colour = NA
-  ) +
-  geom_line(linewidth = 1) +
-  scale_x_reverse() +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Radiocarbon Intensity",
-    colour = "Cluster",
-    fill = "Cluster"
-  ) +
+  scale_x_reverse()+
   theme_classic()
 ```
 
 ```{r}
-# COompare age ranges
+# Compare age ranges
 intervals <- tribble(
   ~period, ~start, ~end,
-  "18–12 ka", 12000, 18000,
-  "12–8 ka", 8000, 12000,
-  "8–4 ka",   4000, 8000,
-  "4–2 ka",    2000,  4000
-)
+  "Robberg", 13145, 19923,
+  "Oakhurst",   8705, 12789,
+  "Wilton",    4636,  7784,
+  "Final Later Stone Age", 1318, 3898
+) |>
+  mutate(period = as.factor(period),
+         period = fct_relevel(period, c('Robberg', 'Oakhurst', 'Wilton',
+                                        'Final Later Stone Age')))
 
 interval_grid <- crossing(
   intervals,
   cluster_fct = levels(fit_df$cluster_fct),
-  calBP = seq(2000, 18000, by = 500)
+  calBP = seq(1000, 18000, by = 500)
 ) |>
   filter(
     calBP >= pmin(start, end),
     calBP <= pmax(start, end)
   ) |>
   mutate(
-    time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000
+    time_ka = -(calBP - mean(calBP, na.rm = TRUE))/1000
   )
 
 interval_pred <- posterior_epred(
@@ -1017,15 +1562,13 @@ interval_summary <- pred_long |>
   group_by(period, cluster_fct) |>
   summarise(
     estimate = median(mean_count),
-    lower = quantile(mean_count, 0.025),
-    upper = quantile(mean_count, 0.975),
+    lower = quantile(mean_count, 0.05),
+    upper = quantile(mean_count, 0.95),
     .groups = "drop"
   )
 
 
 interval_summary |>
-  mutate(period = fct_relevel(period,
-                              "18–12 ka", "12–8 ka", "8–4 ka", "4–2 ka")) |>
   
   ggplot(aes(x = cluster_fct, y = estimate)) +
   geom_point(size = 3) +
@@ -1042,17 +1585,19 @@ interval_summary |>
 ###################################################
 ###################################################
 ###################################################
+time_mean <- mean(fit_df$calBP, na.rm = TRUE)
+
 interval_grid <- crossing(
   intervals,
   cluster_cat = unique(fit_df$cluster_cat),
-  calBP = seq(2000, 18000, by = 500)
+  calBP = seq(1000, 18000, by = 500)
 ) |>
   filter(
     calBP >= pmin(start, end),
     calBP <= pmax(start, end)
   ) |>
   mutate(
-    time_ka = (calBP - mean(calBP, na.rm = TRUE))/1000
+    time_ka = -(calBP - time_mean)/1000
   )
 
 interval_pred <- posterior_epred(
@@ -1084,14 +1629,12 @@ interval_summary <- pred_long |>
   group_by(period, cluster_cat) |>
   summarise(
     estimate = median(mean_count),
-    lower = quantile(mean_count, 0.025),
-    upper = quantile(mean_count, 0.975),
+    lower = quantile(mean_count, 0.05),
+    upper = quantile(mean_count, 0.95),
     .groups = "drop"
   )
 
 interval_summary |>
-  mutate(period = fct_relevel(period,
-                              "18–12 ka", "12–8 ka", "8–4 ka", "4–2 ka")) |>
       
   ggplot(aes(x = cluster_cat, y = estimate)) +
   geom_point(size = 3) +
@@ -1101,6 +1644,7 @@ interval_summary |>
   ) +
   facet_wrap(~period, scales = "free_y") +
   ylab("Radiocarbon Intensity") +
+  xlab("Regional Aggregate") +
   theme_minimal()+
   theme(
     axis.text.x = element_text(angle = 45, hjust = 1)
@@ -1212,7 +1756,10 @@ interval_rate_ratio_summary <- interval_rate_ratios |>
   )
 
 interval_rate_ratio_summary |>
-  filter(prob_greater_1 > 0.90 | prob_greater_1 < 0.10)
+  filter(prob_greater_1 > 0.90 | prob_greater_1 < 0.10) |>
+  mutate(estimate = estimate,
+         lower = lower,
+         upper = upper)
 ```
 
 ### Within cluster change
