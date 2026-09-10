@@ -307,6 +307,7 @@ za_pois_all |>
   geom_bar(stat = "identity") +
   scale_fill_gradient(low = "darkorange", high = "darkblue") +
   xlab("Calibrated Years BP")+
+  scale_x_reverse()+
   theme_minimal(base_size = 8)+
   theme(axis.text.x = element_text(angle = 45,  hjust = 1))
 ```
@@ -543,6 +544,8 @@ fit_df <- za_holocene |>
   filter(Tech != 'ELSA', Tech != 'Final MSA')
 
 
+
+
 fit_df |>
   ggplot(aes(x = calBP, y = site_count, fill = site_count))+
   geom_bar(stat = "identity") +
@@ -620,7 +623,7 @@ fit_time2 <- brm(
 
 ## Hypotheses
 
-### $H_1$:  ***Rates of radiocarbon intensity vary between archaeological sites in southern Africa.***
+### $H_1$: ***Rates of radiocarbon intensity vary between archaeological sites in southern Africa.***
 
 ### $H_2$: ***Periods that correspond to the technological industries will show different rates of radiocarbon intensity based on varying population sizes.***
 
@@ -763,6 +766,48 @@ draws <- posterior_epred(
     .groups = "drop"
   ) 
 
+
+draws |>
+  filter(tech != 'Ceramic LSA') |>
+  mutate(tech = factor(tech, 
+                          levels = c('Robberg', 'Oakhurst',
+                                     'Wilton', 'Final LSA'))) |>
+  
+  ggplot(aes(x = time, y = slope)) +
+  geom_smooth(method = "loess", se = TRUE, span = 0.75) +
+  scale_x_reverse() +
+  
+  annotate("rect", xmin = 19923, xmax = 13145, ymin = -Inf, ymax = Inf,
+           fill = "blue", alpha = 0.2) +
+  annotate("text", x = (19923+13145)/2, y = 25, label = "Robberg", 
+           color = "blue", fontface = "bold", vjust = -0.5) +
+  
+  annotate("rect", xmin = 12789, xmax = 8705, ymin = -Inf, ymax = Inf,
+           fill = "forestgreen", alpha = 0.2) +
+  annotate("text", x = (12789+8705)/2, y = 25, label = "Oakhurst", 
+           color = "forestgreen", fontface = "bold", vjust = -0.5) +
+  
+  annotate("rect", xmin = 7784, xmax = 4636, ymin = -Inf, ymax = Inf,
+           fill = "orange", alpha = 0.2) +
+  annotate("text", x = (7784+4636)/2, y = 25, label = "Wilton", 
+           color = "orange", fontface = "bold", vjust = -0.5) +
+  
+  annotate("rect", xmin = 3898, xmax = 1318, ymin = -Inf, ymax = Inf,
+           fill = "gold", alpha = 0.2) +
+  annotate("text", x = (3898+1318)/2, y = 19, label = "Final Later\nStone Age", 
+           color = "gold", fontface = "bold", vjust = -0.5) +
+  
+  facet_wrap(~tech, scales = 'free') +
+  
+  
+  ylab("Rate of Radiocarbon Intesnity/1,000 years") +
+  xlab("Time (yrs cal BP)") +
+  theme_minimal()
+
+
+```
+
+```{r}
 # examine the radiocarbon rate by technology
 draws_tech <- posterior_epred(
   fit_time2,
@@ -787,6 +832,7 @@ draws_tech <- posterior_epred(
   mutate(time = as.numeric(time),
          tech = as.factor(tech)) |>
   group_by(tech) |>
+  #filter(time <7784) |> # filter this for the wilton and final LSA comparison
   
   summarise(
     slope = median(estimate),
@@ -922,20 +968,19 @@ Yes, of particular interest is the fact that the interior-karoo radiocarbon inte
 
 In particular, though the interior-karoo was significantly different between the Robberg and Oakhurst period (19 ka cal BP - 8.7 ka cal BP), there is no significant difference bewteen radiocarbon intensity and the sites that show Robberg and Oakhurst technologies. However, Wilton technology has a higher rate of radiocarbon intensity within the interior-karoo, implying greater population around sites associated with wilton technology in the interior-karoo. The final LSA also has a lower rate in the interior-karoo than does wilton technology. Given the graphic, this is the general trend for all of southern Africa.
 
-**In conclusion, the technological patterns show homogeneous patterns through southern Africa whereas the temporal trends show significant differences across southern Africa.** Each period shows a monotonic increase in radriocarbon intensity through time, but Africa is regionally distinct over specific periods of time but the technological trends do not track these differences.
+**In conclusion, the technological patterns show homogeneous patterns through southern Africa whereas the temporal trends show significant differences across southern Africa.** Each period shows a monotonic increase in radiocarbon intensity through time, but Africa is regionally distinct over specific periods of time, which the technological trends do not track.
 
 ```{r}
 # combine clustered data from SASSI to the SARD database
 df_tmp <- za_holocene |>
-  st_drop_geometry() |>
   full_join(clustered_data |> 
               st_drop_geometry() |> 
               select(Site, cluster) |>
               distinct(), by = "Site") |>
   filter(!is.na(cluster))
 
-
 fit_df <- df_tmp |>
+  st_drop_geometry() |>
   rename(site_count = count,
          Tech = `Archaeological Sub-chronology`) |>
   group_by(cluster, calBP) |>
@@ -958,6 +1003,41 @@ fit_df <- df_tmp |>
          
          iter = iter) |>
   filter(Tech != 'ELSA', Tech != 'Final MSA')
+
+
+png("map3.png", width = 1200, height = 800, res = 300)
+
+ggplot()+
+  geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
+  geom_sf(data = df_tmp, aes(color = factor(cluster)), size = 0.45) +
+  geom_mark_hull(alpha = 0.2, expand = unit(3, "mm")) +
+  scale_color_discrete(name = "Cluster",
+                       labels = c(
+                         '1' = '1 - Southern Coast',
+                         
+                         '2' = '2 - Northwest Coast',
+                         '9' = '9 - Northwest Coast',
+                         
+                         '3' = '3 - Interior Grassland',
+                         
+                         '4' = '4 - East Coast',
+                         
+                         '5' = '5 - Interior Karoo',
+                         
+                         '6' = '6 - Northeast',
+                         '7' = '7 - Northeast',
+                         '8' = '8 - Northeast'
+                       )) +
+  coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
+  theme_minimal()+
+  theme(axis.text = element_text(size = 3),
+        axis.title = element_text(size = 3),
+        strip.text = element_text(size = 4),
+        
+        legend.title = element_text(size = 5),
+        legend.text = element_text(size = 4))
+
+dev.off()
 ```
 
 ```{r}
@@ -1098,7 +1178,7 @@ interval_summary |>
   theme_minimal()+
   theme(
     axis.text.x = element_text(angle = 45, hjust = 1)
-  ) 
+  ) -> gg_1
 
 
 interval_summary |>
@@ -1115,7 +1195,9 @@ interval_summary |>
   theme_minimal()+
   theme(
     axis.text.x = element_text(angle = 45, hjust = 1)
-  ) 
+  ) -> gg_2
+
+gg_1
 ```
 
 ```{r}
@@ -1246,6 +1328,7 @@ interval_summary <- pred_long |>
   )
 
 interval_summary |>
+  filter(Tech != 'Ceramic LSA') |>
   
   ggplot(aes(x = Tech, y = estimate)) +
   geom_point(size = 3) +
@@ -1259,7 +1342,24 @@ interval_summary |>
   theme_minimal()+
   theme(
     axis.text.x = element_text(angle = 45, hjust = 1)
-  ) 
+  )
+
+interval_summary |>
+  filter(Tech != 'Ceramic LSA') |>
+  
+  ggplot(aes(x = cluster_cat, y = estimate)) +
+  geom_point(size = 3) +
+  geom_errorbar(
+    aes(ymin = lower, ymax = upper),
+    width = 0.15
+  ) +
+  facet_wrap(~Tech, scales = 'free') +
+  ylab("Radiocarbon Intensity") +
+  xlab("Regional Aggregate") +
+  theme_minimal()+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
 ```
 
 ```{r}
@@ -1389,6 +1489,361 @@ slope_pair_comp |>
   filter(str_detect(combination_1, 'Southern') & 
            str_detect(combination_2, 'Southern')) |>
   select(combination_1:combination_2, rate_ratio:rate_ratio_upper)
+
+# Track southern coast rates across technologicl classifications
+slope_pair_comp |>
+  filter(str_detect(combination_1, 'East') & 
+           str_detect(combination_2, 'East')) |>
+  select(combination_1:combination_2, rate_ratio:rate_ratio_upper)
+```
+
+# Change Points
+
+```{r}
+time_mean <- mean(fit_df$calBP, na.rm = TRUE)
+
+interval_grid <- crossing(
+  intervals,
+  cluster_cat = unique(fit_df$cluster_cat),
+  Tech = unique(fit_df$Tech),
+  calBP = seq(1000, 21000, by = 500)
+) |>
+  filter(
+    calBP >= pmin(start, end),
+    calBP <= pmax(start, end)
+  ) |>
+  mutate(
+    time_ka = -(calBP - time_mean)/1000
+  )
+
+interval_pred <- posterior_epred(
+  fit_space_h4,
+  newdata = interval_grid,
+  re_formula = NULL
+)
+
+
+pred_long <- interval_grid |>
+  select(cluster_cat, Tech, calBP) |>
+  bind_cols(
+    as.data.frame(t(interval_pred))
+  ) |>
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "draw",
+    values_to = "mu"
+  ) |>
+  group_by(cluster_cat, Tech, calBP) |>
+  summarize(Estimate = mean(mu),
+            Q2.5 = quantile(mu, 0.025),
+            Q97.5 = quantile(mu, 0.975))
+
+
+# plot robberg distribution
+ggplot(
+  pred_long |> 
+    filter(calBP > 7000,
+           Tech == 'Robberg'),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Tech, scales = 'free') +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  scale_x_reverse()+
+  theme_classic() -> gg_robberg
+
+# plot oakhurst distribution
+ggplot(
+  pred_long |> 
+    filter(calBP > 5000,
+           Tech == 'Oakhurst'),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Tech, scales = 'free') +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  scale_x_reverse()+
+  theme_classic() -> gg_oakhurst
+
+# plot wilton distribution
+ggplot(
+  pred_long |> 
+    filter((calBP > 4000) & (calBP < 12000),
+           Tech == 'Wilton'),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Tech, scales = 'free') +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  scale_x_reverse()+
+  theme_classic() -> gg_wilton
+
+# plot final LSA distribution
+ggplot(
+  pred_long |> 
+    filter(calBP < 7000,
+           Tech == 'Final LSA'),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~Tech, scales = 'free') +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  scale_x_reverse()+
+  theme_classic() -> gg_finalLSA 
+```
+
+```{r}
+ggarrange(
+  gg_robberg, gg_oakhurst,
+  gg_wilton, gg_finalLSA,
+  
+  common.legend = TRUE
+)
+```
+
+```{r}
+time_mean <- mean(fit_df$calBP, na.rm = TRUE)
+
+interval_grid <- crossing(
+  intervals,
+  cluster_cat = unique(fit_df$cluster_cat),
+  calBP = seq(1000, 21000, by = 500)
+) |>
+  filter(
+    calBP >= pmin(start, end),
+    calBP <= pmax(start, end)
+  ) |>
+  mutate(
+    time_ka = -(calBP - time_mean)/1000
+  )
+
+interval_pred <- posterior_epred(
+  fit_space_h3,
+  newdata = interval_grid,
+  re_formula = NULL
+)
+
+
+pred_long <- interval_grid |>
+  select(period, cluster_cat, calBP) |>
+  bind_cols(
+    as.data.frame(t(interval_pred))
+  ) |>
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "draw",
+    values_to = "mu"
+  ) |>
+  group_by(cluster_cat, period, calBP) |>
+  summarize(Estimate = mean(mu),
+            Q2.5 = quantile(mu, 0.025),
+            Q97.5 = quantile(mu, 0.975))
+
+
+# plot robberg distribution
+ggplot(
+  pred_long |> 
+    filter(period == 'Robberg'),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  scale_x_reverse()+
+  theme_classic() -> gg_robberg
+
+# plot oakhurst distribution
+ggplot(
+  pred_long |> 
+    filter(period == 'Oakhurst'),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  scale_x_reverse()+
+  theme_classic() -> gg_oakhurst
+
+# plot wilton distribution
+ggplot(
+  pred_long |> 
+    filter(period == 'Wilton'),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  scale_x_reverse()+
+  theme_classic() -> gg_wilton
+
+# plot final LSA distribution
+ggplot(
+  pred_long |> 
+    filter(period == 'Final LSA'),
+  aes(
+    x = calBP,
+    y = Estimate,
+    group = cluster_cat,
+    colour = cluster_cat
+  )
+) +
+  geom_ribbon(
+    aes(
+      ymin = Q2.5,
+      ymax = Q97.5,
+      fill = cluster_cat
+    ),
+    alpha = 0.15,
+    colour = NA
+  ) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = "Calendar age (cal BP)",
+    y = "Radiocarbon Intensity",
+    colour = "Cluster",
+    fill = "Cluster"
+  ) +
+  scale_x_reverse()+
+  theme_classic() -> gg_finalLSA 
+```
+
+```{r}
+ggarrange(
+  gg_robberg, gg_oakhurst,
+  gg_wilton, gg_finalLSA,
+  
+  common.legend = TRUE
+)
 ```
 
 # Junks
