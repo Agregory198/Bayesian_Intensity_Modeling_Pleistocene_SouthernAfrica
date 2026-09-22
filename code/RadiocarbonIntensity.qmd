@@ -119,9 +119,64 @@ marine_bins <- binPrep(za_marine$Site, ages = za_marine_cal, h = 250)
 za_cal <- rcarbon::combine(za_terr_cal, za_marine_cal)
 ```
 
+# Sensitivity testing
+
+```{r}
+# Test how bin sizes of 50, 100, 150, and 200 years affect the distribution
+binsense(x = za_marine_cal, y = za_marine$labnr,
+         h=seq(0,5000,100), timeRange = c(max_age, min_age))
+
+binsense(x = za_terr_cal, y = za_terr$labnr,
+         h=seq(0,5000,100), timeRange = c(max_age, min_age))
+```
+
+```{r}
+za_sens <- tibble(calBP = numeric(),
+                    PrDense = numeric(),
+                    BinSize = numeric())
+
+bin_size = seq(0, 500, 50)
+for(i in bin_size){
+  
+  za_bins <- binPrep(za$Site, ages = za_cal, h = i)
+  
+  # subset CalDates object based on random thinning
+  za_thinned <- za_cal[thinDates(ages=za$c14age,  
+                                 errors=za$c14std, 
+                                 bins=za_bins,
+                                 size=1, method='random')]
+  
+  za_thinned <- spd(za_thinned, timeRange=c(max_age, min_age))
+  
+  za_thin_df <- za_thinned$grid |>
+    as_tibble() |>
+    mutate(BinSize = i)
+  
+  za_sens <- rbind(za_sens, za_thin_df)
+  
+}
+
+
+
+```
+
+```{r}
+za_sens |>
+  ggplot()+
+    geom_line(aes(x = calBP, y = PrDens, color = BinSize))+
+    scale_x_reverse() +
+    scale_color_continuous() +
+    ylab('Raadiocarbon Density') +
+    xlab('Years (cal BP)') +
+    theme_minimal()
+    
+```
+
+## Site-wise binning
+
 ```{r}
 time_range =  c(max_age, min_age)
-time_range_df = data.frame(calBP = max_age:min_age)
+time_range_df = tibble(calBP = max_age:min_age)
 
 
 
@@ -130,17 +185,20 @@ za_cal_site <- za_cal |>
 
 # Need to sample sites and dates, then combine
 za_spd_df <- tibble(site = character(),
+                    BinSize = numeric(),
                     calBP = numeric(),
                     PrDens = numeric())
 
-for(i in unique(za$labnr)){
-  
+BinSize = seq(0, 500, 50)
 
-    
+for(i in unique(za$Site)){
+  
+  for(j in BinSize){
     
     tmp_site <- za |>
-      filter(labnr == i) |>
-      select(Site)
+      filter(Site == i) |>
+      select(Site) |>
+      distinct()
     
     tmp_za <- za |>
       filter(Site == tmp_site$Site)
@@ -152,12 +210,12 @@ for(i in unique(za$labnr)){
       drop_na(c14age, c14std)
     
     if(dim(za_terr)[1] != 0){
-    
-    za_terr_cal <- rcarbon::calibrate(za_terr$c14age , za_terr$c14std,
-                                      calCurves = 'shcal20',
-                                      ids = za_terr$labnr,
-                                      verbose = FALSE)
-    
+      
+      za_terr_cal <- rcarbon::calibrate(za_terr$c14age , za_terr$c14std,
+                                        calCurves = 'shcal20',
+                                        ids = za_terr$labnr,
+                                        verbose = FALSE)
+      
     }
     
     # filter by marine material and apply marien curve and offset
@@ -166,7 +224,7 @@ for(i in unique(za$labnr)){
                              'marine other')) |>
       drop_na(c14age, c14std)
     if(dim(za_marine)[1] != 0){
-    
+      
       za_marine_cal <- rcarbon::calibrate(za_marine$c14age, 
                                           za_marine$c14std,
                                           calCurves = rep('marine20',
@@ -189,23 +247,37 @@ for(i in unique(za$labnr)){
     
     
     target_bins = binPrep(sites = c(za_terr$Site, za_marine$Site),
-                          ages = c(za_terr$c14age, za_marine$c14age), h = 100)
+                          ages = c(za_terr$c14age, za_marine$c14age), 
+                          h = j)
     
+    # subset CalDates object based on random thinning
+    za_thinned <- za_cal[thinDates(ages=c(za_terr$c14age, za_marine$c14age),  
+                                   errors=c(za_terr$c14std, za_marine$c14std),
+                                   bins=target_bins,
+                                   size=1, method='random')]
     
-    tmp_spd = spd(x = za_cal,
-                  bins = target_bins, 
-                  timeRange = c(max_age, min_age), 
-                  datenormalised = FALSE,
-                  runm = 100)
+    za_thinned <- spd(za_thinned, 
+                      timeRange=c(max_age, min_age), 
+                      datenormalised = FALSE,
+                      runm = 100)
     
-    tmp_spd_df <- as_tibble(tmp_spd$grid)
+    za_thin_df <- za_thinned$grid |>
+      as_tibble() |>
+      mutate(Site = i,
+             BinSize = j)
     
     za_spd_df <- za_spd_df |>
-      add_row(site = tmp_site$Site,
-              calBP = tmp_spd_df$calBP,
-              PrDens = tmp_spd_df$PrDens)
+      add_row(site = i,
+              BinSize = j,
+              calBP = za_thin_df$calBP,
+              PrDens = za_thin_df$PrDens)
+    
+  }
+  
 }
 ```
+
+## Region-wise binning
 
 ```{r}
 site_prob <- za_spd_df |>
