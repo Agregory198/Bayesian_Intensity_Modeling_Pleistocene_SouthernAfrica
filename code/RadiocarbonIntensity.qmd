@@ -11,14 +11,21 @@ editor: visual
 
 # load libraries
 library(ggplot2)
+library(plotly)
+library(mapview)
 library(ggridges)
 library(ggforce)
 library(ggpubr)
+library(ggtrendline)
 
 library(tidyverse)
+library(data.table)
+library(duckdb)
 library(purrr)
+library(splines)
 
 library(tidybayes)
+library(bayesplot)
 library(brms)
 
 library(here)
@@ -46,6 +53,10 @@ require(doParallel)
 require(doRNG)
 ```
 
+# 
+
+# Load and Organize Data
+
 ```{r}
 seed = 1
 set.seed(1)
@@ -54,355 +65,104 @@ set.seed(1)
 # set directory
 dir = here::here()
 
+# Load data from external code
+za_count <- read_csv(paste0(dir, "/data/za_count_site.csv"))
+za_count_taph <- read_csv(paste0(dir, '/data/za_count_site_taph.csv'))
+
 # read in and modify data names and assign as date list for c14bazAAR
 c14_za <- read_csv(paste0(dir, "/data/SARD_Mar2021_14C.csv")) |>
   rename(c14age = Date, c14std = Uncertainty,  labnr = 'Lab ID',
          lon = DecdegE, lat = DecdegS,
-         material = 'Material dated', species = Species) |>
+         material = 'Material dated', species = Species,
+         Industry =`Archaeological Sub-chronology`,
+         SiteType = `Site Type`) |>
+  filter(Industry %in% c('Robberg', 'Oakhurst',
+                         'Wilton', 'Ceramic LSA', 'Final LSA', 
+                         'ELSA', 'ELSA/transitional'),
+         
+         Country %in% c('South Africa', 'Lesotho')) |>
+  mutate(c14age = as.numeric(c14age),
+         c14std = as.numeric(c14std),
+         
+         Industry = ifelse(Industry == 'ELSA/transitional', 'ELSA', Industry),
+         Industry = ifelse(Industry == 'Ceramic LSA', 'Final LSA', Industry)) |>
+  
   as.c14_date_list()
 
-# load the SASSI database for full ZA site locations
-sassi <- read_csv(paste0(dir, '/data/SASSI_v3.2_S1.csv')) |>
-  pivot_longer('ESA':'CeramicLSA', names_to = 'Industry', 
-               values_to = 'Presence') |>
-  mutate(Presence = ifelse(!is.na(Presence), 1, 0)) |>
-  filter((Industry %in% c('LSA', 'GenLSA', 'Robberg', 'Oakhurst', 
-                         'Wilton', 'FinalLSA', 'CeramicLSA')) &
-           (Presence == 1))
+za_df <- za_count %>%
+  left_join(c14_za %>% 
+               select(Site, labnr, Industry, `SiteType`, lat, lon, Country),
+             by = c('Site', 'labnr')) %>%
+  group_by(site_bins) %>%
+  arrange(Industry) %>%
+  mutate(Industry = first(Industry)) %>%
+  ungroup() %>%
+  group_by(Site) %>%
+  arrange(lat) %>%
+  mutate(lat = first(lat),
+         lon = first(lon)) %>%
+  arrange(Country) %>%
+  mutate(Country = first(Country)) %>%
+  arrange(`SiteType`) %>%
+  mutate(`Site Type` = first(`SiteType`)) %>%
+  ungroup() %>%
+  mutate(SiteType = ifelse(`SiteType` %in% c('shell midden', 
+                                              'settlement'),
+                           'Intensification', 
+                           ifelse(is.na(`SiteType`), 'Unknown', 
+                                  `SiteType`)),
+         SiteType = factor(SiteType),
+         Zone_Name = factor(Zone_Name))
 
 
-```
 
-```{r}
-# filter by late pleistocene
-max_age <- 21000 
-min_age <- 2000
-temp_res <- 100
-
-#filter to remove human remains as they produce errors when calibrating
-za <- c14_za |>
-  filter(species != "Homo sapiens" | is.na(species)) |>
-  
-  # filter by dates older than 200 years and less than 50 ka
-  filter(c14age > min_age, c14age < max_age)
-
-
-# filter by terrestrial material and apply the terrestrial calibration curve
-za_terr <- za |>
-  filter(!material %in% c('Marine shell', 'marine shell',
-                          'marine other', 'iron')) |>
-  drop_na(c14age, c14std)
-
-za_terr_cal <- rcarbon::calibrate(za_terr$c14age , za_terr$c14std,
-                                      calCurves = 'shcal20',
-                                      ids = za_terr$labnr)
-
-terr_bins <- binPrep(za_terr$Site, ages = za_terr_cal, h = 250)
-
-# filter by marine material and apply marien curve and offset
-za_marine <- za |>
-  filter(material %in% c('Marine shell', 'marine shell',
-                         'marine other')) |>
-  drop_na(c14age, c14std)
-
-za_marine_cal <- rcarbon::calibrate(za_marine$c14age, 
-                                    za_marine$c14std,
-                                    calCurves = rep('marine20',
-                                                    length(za_marine$labnr)),
-                                    resOffset = rep(187, length(za_marine$labnr)),
-                                    resErrors = rep(18, length(za_marine$labnr)),
-                                    ids = za_marine$labnr)
-
-marine_bins <- binPrep(za_marine$Site, ages = za_marine_cal, h = 250)
-
-# combine data
-za_cal <- rcarbon::combine(za_terr_cal, za_marine_cal)
-```
-
-# Sensitivity testing
-
-```{r}
-# Test how bin sizes of 50, 100, 150, and 200 years affect the distribution
-binsense(x = za_marine_cal, y = za_marine$labnr,
-         h=seq(0,5000,100), timeRange = c(max_age, min_age))
-
-binsense(x = za_terr_cal, y = za_terr$labnr,
-         h=seq(0,5000,100), timeRange = c(max_age, min_age))
-```
-
-```{r}
-za_sens <- tibble(calBP = numeric(),
-                    PrDense = numeric(),
-                    BinSize = numeric())
-
-bin_size = seq(0, 500, 50)
-for(i in bin_size){
-  
-  za_bins <- binPrep(za$Site, ages = za_cal, h = i)
-  
-  # subset CalDates object based on random thinning
-  za_thinned <- za_cal[thinDates(ages=za$c14age,  
-                                 errors=za$c14std, 
-                                 bins=za_bins,
-                                 size=1, method='random')]
-  
-  za_thinned <- spd(za_thinned, timeRange=c(max_age, min_age))
-  
-  za_thin_df <- za_thinned$grid |>
-    as_tibble() |>
-    mutate(BinSize = i)
-  
-  za_sens <- rbind(za_sens, za_thin_df)
-  
-}
-
-
+za_df_taph <- za_count_taph %>%
+  left_join(c14_za %>% 
+              select(Site, labnr, Industry, `SiteType`, lat, lon, Country),
+            by = c('Site', 'labnr')) %>%
+  group_by(site_bins) %>%
+  arrange(Industry) %>%
+  mutate(Industry = first(Industry)) %>%
+  ungroup() %>%
+  group_by(Site) %>%
+  arrange(lat) %>%
+  mutate(lat = first(lat),
+         lon = first(lon)) %>%
+  arrange(Country) %>%
+  mutate(Country = first(Country)) %>%
+  arrange(`SiteType`) %>%
+  mutate(`SiteType` = first(`SiteType`)) %>%
+  ungroup() %>%
+  mutate(SiteType = ifelse(`SiteType` %in% c('shell midden', 
+                                              'settlement'),
+                           'Intensification', 
+                           ifelse(is.na(`SiteType`), 'Unknown', 
+                                  `SiteType`)),
+         SiteType = factor(SiteType),
+         Zone_Name = factor(Zone_Name))
 
 ```
 
-```{r}
-za_sens |>
-  ggplot()+
-    geom_line(aes(x = calBP, y = PrDens, color = BinSize))+
-    scale_x_reverse() +
-    scale_color_continuous() +
-    ylab('Raadiocarbon Density') +
-    xlab('Years (cal BP)') +
-    theme_minimal()
-    
-```
-
-## Site-wise binning
+# Visualize Data
 
 ```{r}
-time_range =  c(max_age, min_age)
-time_range_df = tibble(calBP = max_age:min_age)
+# Sites miscalssified as interior
+#sites_offset <- c('Jakkalsberg N', 'Matjies River', 'St Francis Bay',
+ #                 'Shixini 3013', 'Waterfall Bluff', 'Umhlatuzana',
+  #                'Shongweni South')
 
+#sites_offset_karoo <- c('Blydefontein', 'Rooikrans')
 
-
-za_cal_site <- za_cal |>
-  as_tibble()
-
-# Need to sample sites and dates, then combine
-za_spd_df <- tibble(site = character(),
-                    BinSize = numeric(),
-                    calBP = numeric(),
-                    PrDens = numeric())
-
-BinSize = seq(0, 500, 50)
-
-for(i in unique(za$Site)){
-  
-  for(j in BinSize){
-    
-    tmp_site <- za |>
-      filter(Site == i) |>
-      select(Site) |>
-      distinct()
-    
-    tmp_za <- za |>
-      filter(Site == tmp_site$Site)
-    
-    
-    za_terr <- tmp_za |>
-      filter(!material %in% c('Marine shell', 'marine shell',
-                              'marine other', 'iron')) |>
-      drop_na(c14age, c14std)
-    
-    if(dim(za_terr)[1] != 0){
-      
-      za_terr_cal <- rcarbon::calibrate(za_terr$c14age , za_terr$c14std,
-                                        calCurves = 'shcal20',
-                                        ids = za_terr$labnr,
-                                        verbose = FALSE)
-      
-    }
-    
-    # filter by marine material and apply marien curve and offset
-    za_marine <- tmp_za |>
-      filter(material %in% c('Marine shell', 'marine shell',
-                             'marine other')) |>
-      drop_na(c14age, c14std)
-    if(dim(za_marine)[1] != 0){
-      
-      za_marine_cal <- rcarbon::calibrate(za_marine$c14age, 
-                                          za_marine$c14std,
-                                          calCurves = rep('marine20',
-                                                          length(za_marine$labnr)),
-                                          resOffset = rep(187, length(za_marine$labnr)),
-                                          resErrors = rep(18, length(za_marine$labnr)),
-                                          ids = za_marine$labnr,
-                                          
-                                          verbose = FALSE)
-    }
-    
-    # combine data
-    if((dim(za_terr)[1] == 0 & dim(za_marine)[1] != 0)){
-      za_cal <- za_marine_cal
-    } else if((dim(za_terr)[1] != 0 & dim(za_marine)[1] == 0)){
-      za_cal <- za_terr_cal
-    } else{
-      za_cal <- rcarbon::combine(za_terr_cal, za_marine_cal)
-    }
-    
-    
-    target_bins = binPrep(sites = c(za_terr$Site, za_marine$Site),
-                          ages = c(za_terr$c14age, za_marine$c14age), 
-                          h = j)
-    
-    # subset CalDates object based on random thinning
-    za_thinned <- za_cal[thinDates(ages=c(za_terr$c14age, za_marine$c14age),  
-                                   errors=c(za_terr$c14std, za_marine$c14std),
-                                   bins=target_bins,
-                                   size=1, method='random')]
-    
-    za_thinned <- spd(za_thinned, 
-                      timeRange=c(max_age, min_age), 
-                      datenormalised = FALSE,
-                      runm = 100)
-    
-    za_thin_df <- za_thinned$grid |>
-      as_tibble() |>
-      mutate(Site = i,
-             BinSize = j)
-    
-    za_spd_df <- za_spd_df |>
-      add_row(site = i,
-              BinSize = j,
-              calBP = za_thin_df$calBP,
-              PrDens = za_thin_df$PrDens)
-    
-  }
-  
-}
-```
-
-## Region-wise binning
-
-```{r}
-site_prob <- za_spd_df |>
-  mutate(
-    bin = floor(calBP / temp_res) * temp_res
-  ) |>
-  group_by(site, bin) |>
-  summarise(
-    prob = sum(PrDens),
-    .groups = "drop"
-  ) |>
-  complete(
-    site = unique(za_spd_df$site),
-    bin = seq(
-      floor(max_age / temp_res) * temp_res,
-      floor(min_age / temp_res) * temp_res,
-      by = -temp_res
-    ),
-    fill = list(prob = 0)
-  ) |>
-  group_by(site) |>
-  mutate(
-    p = prob / sum(prob)
-  ) |>
-  ungroup()
-
-
-
-dates_samp <- site_prob |>
-  group_by(site) |>
-  filter(sum(p) > 0) |>
-  slice_sample(
-    n = 1,
-    weight_by = p,
-    replace = TRUE
-  ) |>
-  ungroup() |>
-  rename(calBP = bin)
-
-
-iter <- 5000
-seed = seed + 1
-set.seed(seed)
-
-dates_samp <- purrr::map_dfr(
-  seq_len(iter),
-  function(k) {
-    
-    site_prob |>
-      group_by(site) |>
-      filter(sum(p) > 0) |>
-      slice_sample(
-        n = 1,
-        weight_by = p,
-        replace = TRUE
-      ) |>
-      ungroup() |>
-      mutate(iter = k)
-    
-  }
-)
-
-
-
-site_counts <- site_prob |>
-  select(site, bin, p) |>
-  left_join(
-    dates_samp |>
-      count(site, bin, name = "site_count"),
-    by = c("site", "bin")
-  ) |>
-  mutate(
-    site_count = replace_na(site_count, 0)
-  )
-
-
-local_lambda <- site_prob |>
-  mutate(
-    lambda = iter * p,
-    local_rate = lambda / temp_res
-  )
-
-
-za_pois_all <- local_lambda |>
-  mutate(
-    count = rbinom(
-      n(),
-      size = iter,
-      prob = p
-    )
-  ) |>
-  rename(calBP = bin)
-```
-
-```{r}
-png(paste0(dir, "/results/figures/fig4A.png"), 
-    width = 1200, height = 800, res = 300)
-
-za_pois_all |>
-  rename(Count = count) |>
-  ggplot(aes(x = calBP, y = Count, fill = Count))+
-  geom_bar(stat = "identity") +
-  scale_fill_gradient(low = "darkorange", high = "darkblue") +
-  xlab("Calibrated Years BP")+
-  scale_x_reverse()+
-  theme_minimal(base_size = 8)+
-  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
-
-dev.off()
-```
-
-```{r}
+#sites_offset_grass <- c('iNkolimahashi Shelter')
 ###########################################
 ########### ASSIGN SARD DATA ##############
-za_comb <- za_pois_all |>
-  rename(Site = site) |>
-  left_join(za |> select(Site, lat, lon, Country, Biome, `Archaeological Period`,
-                          `Archaeological Sub-chronology`, `Province or district`,
-                          `Site Type`) |> distinct(Site, .keep_all = TRUE),
-             by = 'Site') |>
+za_map <- za_df %>%
+  distinct(Site, lat, lon, .keep_all = TRUE) %>%
+  filter(!is.na(Zone_Name), !is.na(lat)) %>%
   ungroup()
-
-
+  
 sites_sf <- st_as_sf(
-  za_comb,
+  za_map,
   coords = c("lon", "lat"),
   crs = 4326
 )
@@ -415,1555 +175,2260 @@ sites_proj <- st_transform(
 
 coords <- st_coordinates(sites_proj)
 
-za_coords <- za_comb |>
+
+za_sard <- sites_proj |>
   mutate(x = coords[,1],
-         y = coords[,2])
-
-study_area <- st_bbox(sites_proj) |>
-  st_as_sfc() |>
-  st_buffer(dist = 10000) |>
-  vect()
-
-###########################################
-########### ASSIGN SASSI DATA ##############
-
-
-sassi_sf <- st_as_sf(
-  sassi,
-  coords = c("Longitude", "Latitude"),
-  crs = 4326
-)
-
-sassi_proj <- st_transform(
-  sassi_sf,
-  32734
-)
-
-
-sassi_coords <- st_coordinates(sassi_proj)
-
-sassi_coords <- sassi |>
-  mutate(x = sassi_coords[,1],
-         y = sassi_coords[,2])
-
-sassi_area <- st_bbox(sassi_proj) |>
-  st_as_sfc() |>
-  st_buffer(dist = 10000) |>
-  vect()
-
-sassi_holocene <- sassi_proj |>
-  mutate(x = st_coordinates(sassi_proj)[,1],
-         y = st_coordinates(sassi_proj)[,2],
-         
-         Industry = as.factor(ifelse(Industry == 'CeramicLSA', 
-                           'Ceramic Final Later Stone Age',
-                    ifelse(Industry == 'FinalLSA', 'Final Later Stone Age',
-                           Industry))),
-         
-         Industry = fct_relevel(Industry, c('Robberg', 'Oakhurst',
-                                            'Wilton', 'Final Later Stone Age',
-                                            'Ceramic Final Later Stone Age')))
+         y = coords[,2]) %>% 
+  filter(Country %in% c('South Africa', 'Lesotho'))
 
 africa_map <- ne_countries(scale = "medium", 
                            continent = "Africa", returnclass = "sf")
 
 
-png(paste0(dir, "/results/figures/supp_fig1.png"), 
-    width = 1200, height = 800, res = 300)
+png(paste0(dir, "/results/figures/Fig1.png"), 
+    width = 2400, height = 1800, res = 300)
 
 ggplot()+
   geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
-  geom_sf(data = sassi_holocene  |>
-            filter(Industry != 'GenLSA', Industry != 'LSA'),
-          aes(color = Biome), size = 0.45) +
-  facet_wrap(~Industry)+
+  geom_sf(data = za_sard %>% mutate(
+    Industry = factor(Industry, levels = c('Robberg', 'Oakhurst',
+                                           'Wilton', 'Final LSA'))
+  ),
+  aes(color = Zone_Name)) +
   coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
-  theme_minimal() +
-  theme(axis.text = element_text(size = 3),
-        axis.title = element_text(size = 3),
-        strip.text = element_text(size = 4),
-        
-        legend.title = element_text(size = 5),
-        legend.text = element_text(size = 4))
-
-dev.off()
-```
-
-```{r}
-za_holocene <- sites_proj |>
-  mutate(x = st_coordinates(sites_proj)[,1],
-         y = st_coordinates(sites_proj)[,2])
-
-africa_map <- ne_countries(scale = "medium", 
-                           continent = "Africa", returnclass = "sf")
-
-png(paste0(dir, "/results/figures/fig1A_right.png"), 
-    width = 1200, height = 800, res = 300)
-
-ggplot()+
-  geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
-  geom_sf(data = za_holocene, aes(color = `Biome`)) +
-  coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
+  labs(color = 'RFZ') +
   theme_minimal()
 
 dev.off()
-```
-
-```{r}
-# 1. Prepare your data (using built-in multishapes dataset example)
-
-df_tmp <- sassi_holocene[, 21:22] |>
-  st_drop_geometry() |>
-  distinct()
 
 
-kNNdistplot(df_tmp, k = 4)
-abline(h = 105000, col = "red", lty = 2)
-```
+png(paste0(dir, "/results/figures/Fig2.png"), 
+    width = 2400, height = 1800, res = 300)
 
-```{r}
-nn <- frNN(sassi_holocene |> distinct(Site, .keep_all = TRUE) |> st_coordinates(),
-           eps = 105000)
-
-hist(lengths(adjacencylist(nn)),
-     xlab = "k", main="Number of Neighbors",
-     sub = paste("Neighborhood size eps =", nn$eps))
-
-
-min_obs <- 4
-
-
-clustered_data <- sassi_holocene |>
-  distinct(Site, .keep_all = TRUE) |>
-  select(Site) |>
-  
-  mutate(cluster = {
-    
-    # Run DBSCAN (adjust eps and minPts to your data's scale)
-    res <- dbscan(nn, minPts = min_obs)
-    
-    # Return cluster assignments (0 represents noise/outliers)
-    res$cluster
-  }) |>
-  st_drop_geometry() |>
-  
-  full_join(sassi_holocene, by = "Site") |>
-  st_sf()
-
-clustered_data |>
-  group_by(cluster) |>
-  mutate(n_cluster = n()) |>
-  filter(n_cluster < 15) |>
-  group_by(Site, cluster, n_cluster) |>
-  summarize(n_site = n()) |>
-  mutate(Site_ex = ifelse((n_cluster == n_site) | (n_site < min_obs), 1, 0)) |>
-  filter(Site_ex == 1) -> site_exc
-
-#  Remove the noise cluster and clusters with too few site-specific observations
-clustered_data <- clustered_data |> filter(!(cluster %in% c(0, site_exc$cluster)))
-
-
-hulls_sf <- clustered_data |>
-  group_by(cluster) |>
-  summarize(geometry = st_combine(geometry)) |>
-  st_convex_hull()
-
-
-png(paste0(dir, "/results/figures/fig2A_left.png"), 
-    width = 1200, height = 800, res = 300)
-# Explore clustered data
 ggplot()+
   geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
-  #geom_sf(data = hulls_sf, aes(fill = factor(cluster)), 
-   #       alpha = 0.2, color = "black", size = 0.5) +
-  geom_sf(data = clustered_data, aes(color = factor(cluster)), size = 0.45) +
-  geom_mark_hull(alpha = 0.2, expand = unit(3, "mm")) +
-  scale_color_discrete(name = "Cluster",
-                       labels = c(
-                         '1' = '1 - Southern Coast',
-                         
-                         '2' = '2 - Northwest Coast',
-                         '9' = '9 - Northwest Coast',
-                         
-                         '3' = '3 - Interior Grassland',
-                         
-                         '4' = '4 - East Coast',
-                         
-                         '5' = '5 - Interior Karoo',
-                         
-                         '6' = '6 - Northeast',
-                         '7' = '7 - Northeast',
-                         '8' = '8 - Northeast'
-                       )) +
+  geom_sf(data = za_sard %>% mutate(
+    Industry = factor(Industry, levels = c('Robberg', 'Oakhurst',
+                                              'Wilton', 'Final LSA'))
+  ) %>% filter(!is.na(Industry)),
+          aes(color = Zone_Name)) +
+  facet_wrap(~Industry) +
   coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
-  theme_minimal()+
-  theme(axis.text = element_text(size = 3),
-        axis.title = element_text(size = 3),
-        strip.text = element_text(size = 4),
-        
-        legend.title = element_text(size = 5),
-        legend.text = element_text(size = 4))
+  labs(color = 'Regional Context') +
+  theme_minimal()
 
 dev.off()
+
 ```
 
-# Hierarchical Modeling
+# Longitudinal Analysis
 
 ```{r}
 
-fit_df <- za_holocene |>
-  st_drop_geometry() |>
-  rename(site_count = count,
-         Tech = `Archaeological Sub-chronology`) |>
-  ungroup() |>
-  
-  mutate(time_s = as.numeric(scale(calBP)),
-         time_red = calBP/1000,
-         time_ka = -(calBP - mean(calBP, na.rm = TRUE))/1000,
-         
-         Tech = ifelse(str_detect(Tech, 'Iron'), 'Ceramic LSA', Tech),
-         
-         iter = iter) |>
-  filter(Tech != 'ELSA', Tech != 'Final MSA')
+fit_df <- za_df %>%
+  group_by(calBP) %>%
+  summarize(
+    site_count = sum(count, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    median_calBP = calBP,
+    time_ka = -(calBP - mean(calBP, na.rm = TRUE)) / 1000
+  )
+
+fit_df_taph <- za_df_taph %>%
+  group_by(calBP) %>%
+  summarize(
+    site_count = sum(count, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    median_calBP = calBP,
+    time_ka = -(calBP - mean(calBP, na.rm = TRUE)) / 1000
+  )
+
+
+
+png(paste0(dir, "/results/figures/map1.png"), 
+    width = 1200, height = 800, res = 300)
+
+fit_df %>%
+  ggplot(aes(x = calBP, y = site_count, fill = site_count))+
+  geom_line() +
+  #scale_fill_gradient(low = "darkorange", high = "darkblue") +
+  xlab("Calibrated Years BP")+
+  scale_x_reverse() +
+  theme_minimal(base_size = 8)+
+  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
+
+dev.off()
+
 
 
 png(paste0(dir, "/results/figures/map2.png"), 
     width = 1200, height = 800, res = 300)
 
-fit_df |>
+fit_df_taph %>%
   ggplot(aes(x = calBP, y = site_count, fill = site_count))+
-  geom_bar(stat = "identity") +
-  facet_wrap(~Tech, scale = "free") +
-  scale_fill_gradient(low = "darkorange", high = "darkblue") +
+  geom_line() +
+  #scale_fill_gradient(low = "darkorange", high = "darkblue") +
   xlab("Calibrated Years BP")+
+  scale_x_reverse() +
+  theme_minimal(base_size = 8)+
+  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
+
+dev.off()
+
+
+
+```
+
+## Site count Vs Time
+
+```{r}
+
+# this model shows cluster show almost no variation after accounting for mean site count
+my_prior <-
+  prior(normal(0, 1), class ='Intercept')+
+  prior(normal(0, 2), class = 'b')+
+  
+  prior(beta(1, 1), class = 'zi')
+
+seed <- 77177
+fit_space <- brm(
+  site_count ~ 1 + s(time_ka),
+  
+  family = zero_inflated_poisson(),
+  
+  data = fit_df,
+  
+  prior = my_prior,
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed
+)
+
+
+seed <- 77277
+fit_space_taph <- brm(
+  site_count ~ 1 + s(time_ka),
+  
+  family = zero_inflated_poisson(),
+  
+  data = fit_df_taph,
+  
+  prior = my_prior,
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed
+)
+
+```
+
+```{r}
+# posterior checks for reg data
+loo1 <- loo(fit_space)
+pp_check(fit_space)
+
+
+# posterior checks for taph data
+loo2 <- loo(fit_space_taph)
+pp_check(fit_space_taph)
+
+
+```
+
+```{r}
+
+pred_grid <- tibble(
+    time_ka = seq(
+      min(fit_df$time_ka, na.rm = TRUE),
+      max(fit_df$time_ka, na.rm = TRUE),
+      length.out = 100
+    )
+  )
+
+pred <- posterior_epred(
+  fit_space,
+  newdata = pred_grid,
+  re_formula = NULL,
+  allow_new_levels = TRUE
+)
+
+
+pred_summary <- pred %>%
+  t() %>%
+  as.data.frame() %>%
+  setNames(paste0("draw_", seq_len(ncol(.)))) %>%
+  bind_cols(pred_grid) %>%
+  pivot_longer(
+    cols = starts_with("draw_"),
+    names_to = "draw",
+    values_to = "mu"
+  ) %>%
+  group_by(time_ka) %>%
+  summarise(
+    estimate = median(mu),
+    lower = quantile(mu, 0.025),
+    upper = quantile(mu, 0.975),
+    .groups = "drop"
+  ) |>
+  mutate(calBP = (-time_ka * 1000) + mean(fit_df$calBP)) %>%
+  filter(calBP < 27000, calBP > 1500)
+
+
+png(paste0(dir, "/results/figures/Fig5A.png"), 
+    width = 2200, height = 800, res = 300)
+
+ggplot() +
+  
+  # Observed site counts
+  #geom_line(
+  #data = fit_df %>% filter(calBP > 500, calBP < 29000),
+  #aes(
+  #x = calBP,
+  #y = site_count
+  #),
+  #stat = "identity"
+  #) +
+  
+  #scale_fill_gradient(low = "darkorange", high = "darkblue") 
+  
+  # Bayesian credible interval
+  geom_ribbon(
+    data = pred_summary,
+    aes(
+      x = calBP,
+      ymin = lower,
+      ymax = upper
+    ),
+    alpha = 0.25,
+    fill = "black",
+    color = NA
+  ) +
+  
+  # Posterior mean prediction
+  geom_line(
+    data = pred_summary,
+    aes(
+      x = calBP,
+      y = estimate
+    ),
+    linewidth = 1,
+    color = 'black'
+  ) +
+  
+  # Reverse BP axis
+  scale_x_reverse() +
+  
+  labs(
+    x = "Calibrated Years BP",
+    y = 'Radiocarbon Count',
+    fill = "Site Count"
+  ) +
+  
+  theme_minimal(base_size = 8)
+
+dev.off()
+```
+
+```{r}
+pred <- posterior_epred(
+  fit_space_taph,
+  newdata = pred_grid,
+  re_formula = NULL,
+  allow_new_levels = TRUE
+)
+
+
+pred_summary <- pred %>%
+  t() %>%
+  as.data.frame() %>%
+  setNames(paste0("draw_", seq_len(ncol(.)))) %>%
+  bind_cols(pred_grid) %>%
+  pivot_longer(
+    cols = starts_with("draw_"),
+    names_to = "draw",
+    values_to = "mu"
+  ) %>%
+  group_by(time_ka) %>%
+  summarise(
+    estimate = median(mu),
+    lower = quantile(mu, 0.025),
+    upper = quantile(mu, 0.975),
+    .groups = "drop"
+  ) |>
+  mutate(calBP = (-time_ka * 1000) + mean(fit_df$calBP)) %>%
+  
+  filter(calBP < 27000, calBP > 1500)
+
+
+png(paste0(dir, "/results/figures/Fig6A.png"), 
+    width = 2200, height = 800, res = 300)
+
+ggplot() +
+  
+  # Observed site counts
+  #geom_line(
+  #data = fit_df %>% filter(calBP > 500, calBP < 29000),
+  #aes(
+  #x = calBP,
+  #y = site_count
+  #),
+  #stat = "identity"
+  #) +
+  
+  #scale_fill_gradient(low = "darkorange", high = "darkblue") 
+  
+  # Bayesian credible interval
+  geom_ribbon(
+    data = pred_summary,
+    aes(
+      x = calBP,
+      ymin = lower,
+      ymax = upper
+    ),
+    alpha = 0.25,
+    fill = "black",
+    color = NA
+  ) +
+  
+  # Posterior mean prediction
+  geom_line(
+    data = pred_summary,
+    aes(
+      x = calBP,
+      y = estimate
+    ),
+    linewidth = 1,
+    color = 'black'
+  ) +
+  
+  # Reverse BP axis
+  scale_x_reverse() +
+  
+  labs(
+    x = "Calibrated Years BP",
+    y = 'Radiocarbon Count',
+    fill = "Site Count"
+  ) +
+  
+  theme_minimal(base_size = 8)
+
+dev.off()
+```
+
+### Change Points
+
+```{r}
+# Global change point
+hinge_fun <- stanvar(
+  scode = "
+  real hinge(real x, real cp) {
+    return fmax(0, x - cp);
+  }
+  ",
+  block = "functions"
+)
+
+
+# Three change points per region
+model_fit_3cp <- bf(
+  site_count ~ alpha +
+    beta1 * time_ka +
+    beta2 * hinge(time_ka, cp1) +
+    beta3 * hinge(time_ka, cp2) +
+    beta4 * hinge(time_ka, cp3),
+  
+  alpha ~ 1,
+  beta1 ~ 1,
+  beta2 ~ 1,
+  beta3 ~ 1,
+  beta4 ~ 1,
+  
+  cp1 ~ 1,
+  cp2 ~ 1,
+  cp3 ~ 1,
+  
+  nl = TRUE
+)
+
+
+prior_fit_3cp <- c(
+  
+  # baseline
+  prior(
+    normal(0, 1),
+    class = "b",
+    nlpar = "alpha"
+  ),
+  
+  # initial slope
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta1"
+  ),
+  
+  # slope change at CP1
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta2"
+  ),
+  
+  # additional slope change at CP2
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta3"
+  ),
+  
+  # additional slope change at CP3
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta4"
+  ),
+  
+  # CP1
+  # third change point from Robberg to Oakhurst
+  prior(
+    normal(12, 0.5),
+    class = "b",
+    nlpar = "cp1"
+  ),
+  
+  # CP2
+  # second change point from Oakhurst to wilton
+  prior(
+    normal(6.3, 0.5),
+    class = "b",
+    nlpar = "cp2"
+  ),
+  
+  # CP3
+  # last change point from Wilton to final LSA
+  prior(
+    normal(2.12, 2),
+    class = "b",
+    nlpar = "cp3"
+  )
+)
+
+seed <- seed + 1
+
+fit_time_3cp <- brm(
+  model_fit_3cp,
+  data = fit_df,
+  family = zero_inflated_poisson(),
+  prior = prior_fit_3cp,
+  
+  stanvars = hinge_fun,
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed,
+  
+  sample_prior = 'yes'
+)
+
+
+seed <- seed + 1
+
+fit_time_3cp_taph <- brm(
+  model_fit_3cp,
+  data = fit_df_taph,
+  family = zero_inflated_poisson(),
+  prior = prior_fit_3cp,
+  
+  stanvars = hinge_fun,
+  
+  chains = 1,
+  iter = 4000,
+  warmup = 2000,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed,
+  
+  sample_prior = 'yes'
+)
+
+```
+
+```{r}
+draws_cp3 <- as_draws_df(fit_time_3cp) %>%
+  mutate(
+    
+    # change point 1
+    slope_before_cp1 =
+      b_beta1_Intercept,
+    
+    slope_after_cp1 =
+      b_beta1_Intercept + b_beta2_Intercept,
+    
+    slope_after_cp2 =
+      b_beta1_Intercept + b_beta2_Intercept + b_beta3_Intercept,
+    
+    slope_after_cp3 =
+      b_beta1_Intercept + b_beta2_Intercept + 
+      b_beta3_Intercept + b_beta4_Intercept,
+    
+    CP1 = b_cp1_Intercept,
+    CP2 = b_cp2_Intercept,
+    CP3 = b_cp3_Intercept
+  )
+
+draws_cp3 |>
+  select(slope_before_cp1:slope_after_cp3) |>
+  pivot_longer(
+    everything(),
+    names_to = "Slope",
+    values_to = "cp"
+  ) |>
+  group_by(Slope) |>
+  summarise(
+    estimate = median(cp),
+    lower = quantile(cp, 0.025),
+    upper = quantile(cp, 0.975)
+  )
+
+draws_cp3 |>
+  select(CP1:CP3) |>
+  pivot_longer(
+    everything(),
+    names_to = "ChangePoint",
+    values_to = "cp"
+  ) |>
+  group_by(ChangePoint) |>
+  summarise(
+    estimate = median(cp),
+    lower = quantile(cp, 0.025),
+    upper = quantile(cp, 0.975),
+    
+    calBP_estimate = (-estimate * 1000) + mean(fit_df$calBP),
+    calBP_lwr = (-lower * 1000) + mean(fit_df$calBP),
+    calBP_upr = (-upper * 1000) + mean(fit_df$calBP)
+  )
+
+
+
+
+
+draws_cp3 %>%
+  summarize('P(CP1 < CP2)1' = 
+              mean(b_cp1_Intercept -
+                     b_cp2_Intercept < 0),
+            'P(CP2 < CP3)1' = 
+              mean(b_cp2_Intercept -
+                     b_cp3_Intercept < 0),
+            'P(CP1 < CP3)1' = 
+              mean(b_cp1_Intercept -
+                     b_cp3_Intercept < 0)) %>%
+  
+  pivot_longer(cols = everything(), names_to = 'Contrast', 
+               values_to = 'Probability')
+
+  
+```
+
+```{r}
+# Taphonomic adjustments
+draws_cp3 <- as_draws_df(fit_time_3cp_taph) %>%
+  mutate(
+    
+    # change point 1
+    slope_before_cp1 =
+      b_beta1_Intercept,
+    
+    slope_after_cp1 =
+      b_beta1_Intercept + b_beta2_Intercept,
+    
+    slope_after_cp2 =
+      b_beta1_Intercept + b_beta2_Intercept + b_beta3_Intercept,
+    
+    slope_after_cp3 =
+      b_beta1_Intercept + b_beta2_Intercept + 
+      b_beta3_Intercept + b_beta4_Intercept,
+    
+    CP1 = b_cp1_Intercept,
+    CP2 = b_cp2_Intercept,
+    CP3 = b_cp3_Intercept
+  )
+
+draws_cp3 |>
+  select(slope_before_cp1:slope_after_cp3) |>
+  pivot_longer(
+    everything(),
+    names_to = "Slope",
+    values_to = "cp"
+  ) |>
+  group_by(Slope) |>
+  summarise(
+    estimate = median(cp),
+    lower = quantile(cp, 0.025),
+    upper = quantile(cp, 0.975)
+  )
+
+draws_cp3 |>
+  select(CP1:CP3) |>
+  pivot_longer(
+    everything(),
+    names_to = "ChangePoint",
+    values_to = "cp"
+  ) |>
+  group_by(ChangePoint) |>
+  summarise(
+    estimate = median(cp),
+    lower = quantile(cp, 0.025),
+    upper = quantile(cp, 0.975),
+    
+    calBP_estimate = (-estimate * 1000) + mean(fit_df$calBP),
+    calBP_lwr = (-lower * 1000) + mean(fit_df$calBP),
+    calBP_upr = (-upper * 1000) + mean(fit_df$calBP)
+  )
+
+
+
+
+
+draws_cp3 %>%
+  summarize('P(CP1 < CP2)1' = 
+              mean(b_cp1_Intercept -
+                     b_cp2_Intercept < 0),
+            'P(CP2 < CP3)1' = 
+              mean(b_cp2_Intercept -
+                     b_cp3_Intercept < 0),
+            'P(CP1 < CP3)1' = 
+              mean(b_cp1_Intercept -
+                     b_cp3_Intercept < 0)) %>%
+  
+  pivot_longer(cols = everything(), names_to = 'Contrast', 
+               values_to = 'Probability')
+```
+
+## Site count VS Rainfall Zone
+
+```{r}
+fit_df <- za_df %>%
+  group_by(calBP, Zone_Name) %>%
+  summarize(
+    site_count = sum(count, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    median_calBP = calBP,
+    time_ka = -(calBP - mean(calBP, na.rm = TRUE)) / 1000
+  )
+
+fit_df_taph <- za_df_taph %>%
+  group_by(calBP, Zone_Name) %>%
+  summarize(
+    site_count = sum(count, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    median_calBP = calBP,
+    time_ka = -(calBP - mean(calBP, na.rm = TRUE)) / 1000
+  )
+
+# check the length of both data frames to ensure they fit
+anti_result <- fit_df %>%
+  anti_join(fit_df_taph, by = 'calBP')
+
+# the size is different between data frames
+# truncate so they are comparable
+fit_df <- fit_df %>%
+  semi_join(fit_df_taph, by = 'calBP')
+  
+
+png(paste0(dir, "/results/figures/map3.png"), 
+    width = 1200, height = 800, res = 300)
+
+fit_df %>%
+  ggplot(aes(x = calBP, y = site_count, fill = site_count))+
+  geom_line() +
+  #scale_fill_gradient(low = "darkorange", high = "darkblue") +
+  facet_wrap(~Zone_Name) +
+  xlab("Calibrated Years BP")+
+  scale_x_reverse() +
+  theme_minimal(base_size = 8)+
+  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
+
+dev.off()
+
+
+png(paste0(dir, "/results/figures/map4.png"), 
+    width = 1200, height = 800, res = 300)
+
+fit_df_taph %>%
+  ggplot(aes(x = calBP, y = site_count, fill = site_count))+
+  geom_line() +
+  #scale_fill_gradient(low = "darkorange", high = "darkblue") +
+  facet_wrap(~Zone_Name) +
+  xlab("Calibrated Years BP")+
+  scale_x_reverse() +
+  theme_minimal(base_size = 8)+
+  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
+
+dev.off()
+
+```
+
+```{r}
+
+my_prior <-
+  prior(normal(0, 1), class = 'Intercept')+
+  
+  prior(normal(0, 2), class = 'b', coef = 'stime_ka:Zone_NameS_1')+
+  prior(normal(0, 2), class = 'b', coef = 'stime_ka:Zone_NameW_1')+
+  prior(normal(0, 2), class = 'b', coef = 'stime_ka:Zone_NameY_1')+
+  
+  prior(exponential(1), class = 'sd', coef = 'Intercept', group = 'Zone_Name')+
+  
+  prior(beta(1, 1), class = 'zi')
+
+seed <- 77795837
+fit_time_rfz_s <- brm(
+  site_count ~ 1 + s(time_ka, by = Zone_Name) + (1|Zone_Name),
+  
+  family = zero_inflated_poisson(),
+  
+  data = fit_df,
+  
+  prior = my_prior,
+  
+  chains = 2,
+  iter = 1000,
+  warmup = 500,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed,
+  
+  sample_prior = 'yes'
+)
+
+
+seed <- 1111142
+fit_time_rfz_s_taph <- brm(
+  site_count ~ 1 + s(time_ka, by = Zone_Name) + (1|Zone_Name),
+  
+  family = zero_inflated_poisson(),
+  
+  data = fit_df_taph,
+  
+  prior = my_prior,
+  
+  chains = 2,
+  iter = 1000,
+  warmup = 500,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed,
+  
+  sample_prior = 'yes'
+)
+```
+
+```{r}
+loo_rfz <- loo(fit_time_rfz_s)
+loo_rfz_t <- loo(fit_time_rfz_s_taph)
+
+loo_compare(loo_rfz, loo_rfz_t)
+```
+
+```{r}
+pred_grid <- tibble(
+  time_ka = seq(
+    min(fit_df$time_ka, na.rm = TRUE),
+    max(fit_df$time_ka, na.rm = TRUE),
+    length.out = 100
+  )
+) %>%
+  expand_grid(
+    Zone_Name = unique(fit_df$Zone_Name)
+  )
+
+pred <- posterior_epred(
+  fit_time_rfz_s,
+  newdata = pred_grid,
+  re_formula = NULL,
+  allow_new_levels = TRUE
+)
+
+
+pred_summary <- pred %>%
+  t() %>%
+  as.data.frame() %>%
+  setNames(paste0("draw_", seq_len(ncol(.)))) %>%
+  bind_cols(pred_grid) %>%
+  pivot_longer(
+    cols = starts_with("draw_"),
+    names_to = "draw",
+    values_to = "mu"
+  ) %>%
+  group_by(time_ka, Zone_Name) %>%
+  summarise(
+    estimate = median(mu),
+    lower = quantile(mu, 0.025),
+    upper = quantile(mu, 0.975),
+    .groups = "drop"
+  ) |>
+  mutate(calBP = (-time_ka * 1000) + mean(fit_df$calBP)) %>%
+  filter(calBP < 27000, calBP > 1500)
+
+
+png(paste0(dir, "/results/figures/Fig6A.png"), 
+    width = 2200, height = 800, res = 300)
+
+ggplot() +
+  
+  geom_ribbon(
+    data = pred_summary,
+    aes(
+      x = calBP,
+      ymin = lower,
+      ymax = upper
+    ),
+    alpha = 0.25,
+    fill = "black",
+    color = NA
+  ) +
+  
+  # Posterior mean prediction
+  geom_line(
+    data = pred_summary,
+    aes(
+      x = calBP,
+      y = estimate
+    ),
+    linewidth = 1,
+    color = 'black'
+  ) +
+  
+  facet_wrap(~Zone_Name, scales = 'free') +
+  
+  # Reverse BP axis
+  scale_x_reverse() +
+  
+  labs(
+    x = "Calibrated Years BP",
+    y = 'Radiocarbon Count',
+    fill = "Site Count"
+  ) +
+  
+  theme_minimal(base_size = 8)
+
+dev.off()
+```
+
+```{r}
+pred_grid <- tibble(
+  time_ka = seq(
+    min(fit_df_taph$time_ka, na.rm = TRUE),
+    max(fit_df_taph$time_ka, na.rm = TRUE),
+    length.out = 100
+  )
+) %>%
+  expand_grid(
+    Zone_Name = unique(fit_df_taph$Zone_Name)
+  )
+
+pred <- posterior_epred(
+  fit_time_rfz_s_taph,
+  newdata = pred_grid,
+  re_formula = NULL,
+  allow_new_levels = TRUE
+)
+
+
+pred_summary <- pred %>%
+  t() %>%
+  as.data.frame() %>%
+  setNames(paste0("draw_", seq_len(ncol(.)))) %>%
+  bind_cols(pred_grid) %>%
+  pivot_longer(
+    cols = starts_with("draw_"),
+    names_to = "draw",
+    values_to = "mu"
+  ) %>%
+  group_by(time_ka, Zone_Name) %>%
+  summarise(
+    estimate = median(mu),
+    lower = quantile(mu, 0.025),
+    upper = quantile(mu, 0.975),
+    .groups = "drop"
+  ) |>
+  mutate(calBP = (-time_ka * 1000) + mean(fit_df_taph$calBP)) %>%
+  filter(calBP < 27000, calBP > 1500)
+
+
+png(paste0(dir, "/results/figures/Fig6A.png"), 
+    width = 2200, height = 800, res = 300)
+
+ggplot() +
+  
+  geom_ribbon(
+    data = pred_summary,
+    aes(
+      x = calBP,
+      ymin = lower,
+      ymax = upper
+    ),
+    alpha = 0.25,
+    fill = "black",
+    color = NA
+  ) +
+  
+  # Posterior mean prediction
+  geom_line(
+    data = pred_summary,
+    aes(
+      x = calBP,
+      y = estimate
+    ),
+    linewidth = 1,
+    color = 'black'
+  ) +
+  
+  facet_wrap(~Zone_Name, scales = 'free') +
+  
+  # Reverse BP axis
+  scale_x_reverse() +
+  
+  labs(
+    x = "Calibrated Years BP",
+    y = 'Radiocarbon Count',
+    fill = "Site Count"
+  ) +
+  
+  theme_minimal(base_size = 8)
+
+dev.off()
+```
+
+```{r}
+expose_functions(fit_time_rfz_3cp_6ka, vectorize = TRUE)
+
+loo_compare(loo(fit_time_rfz_3cp),
+            loo(fit_time_rfz_3cp_taph))
+```
+
+### Change Points
+
+```{r}
+# Global change point
+hinge_fun <- stanvar(
+  scode = "
+  real hinge(real x, real cp) {
+    return fmax(0, x - cp);
+  }
+  ",
+  block = "functions"
+)
+
+
+# Three change points per region
+model_fit_rfz_3cp <- bf(
+  site_count ~ alpha +
+    beta1 * time_ka +
+    beta2 * hinge(time_ka, cp1) +
+    beta3 * hinge(time_ka, cp2) +
+    beta4 * hinge(time_ka, cp3),
+  
+  alpha ~ 1,
+  beta1 ~ 1 + Zone_Name,
+  beta2 ~ 1 + Zone_Name,
+  beta3 ~ 1 + Zone_Name,
+  beta4 ~ 1 + Zone_Name,
+  
+  cp1 ~ 0 + Zone_Name,
+  cp2 ~ 0 + Zone_Name,
+  cp3 ~ 0 + Zone_Name,
+  
+  nl = TRUE
+)
+
+
+prior_fit_rfz_3cp <- c(
+  
+  # baseline
+  prior(
+    normal(0, 1),
+    class = "b",
+    nlpar = "alpha"
+  ),
+  
+  # initial slope
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta1"
+  ),
+  
+  # slope change at CP1
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta2"
+  ),
+  
+  # additional slope change at CP2
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta3"
+  ),
+  
+  # additional slope change at CP3
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta4"
+  ),
+  
+  # CP1
+  # third change point from Robberg to Oakhurst
+  prior(
+    normal(12, 0.5),
+    class = "b",
+    nlpar = "cp1"
+  ),
+  
+  # CP2
+  # second change point from Oakhurst to wilton
+  prior(
+    normal(6.3, 0.5),
+    class = "b",
+    nlpar = "cp2"
+  ),
+  
+  # CP3
+  # last change point from Wilton to final LSA
+  prior(
+    normal(2.12, 2),
+    class = "b",
+    nlpar = "cp3"
+  )
+)
+
+seed <- seed + 1
+
+fit_time_rfz_3cp <- brm(
+  model_fit_rfz_3cp,
+  data = fit_df,
+  family = zero_inflated_poisson(),
+  prior = prior_fit_rfz_3cp,
+  
+  stanvars = hinge_fun,
+  
+  chains = 2,
+  iter = 1000,
+  warmup = 500,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed,
+  
+  sample_prior = 'yes'
+)
+
+
+seed <- seed + 1
+
+fit_time_rfz_3cp_taph <- brm(
+  model_fit_rfz_3cp,
+  data = fit_df_taph,
+  family = zero_inflated_poisson(),
+  prior = prior_fit_rfz_3cp,
+  
+  stanvars = hinge_fun,
+  
+  chains = 2,
+  iter = 1000,
+  warmup = 500,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed,
+  
+  sample_prior = 'yes'
+)
+
+```
+
+### Tests
+
+```{r}
+library(brms)
+library(dplyr)
+library(tidyr)
+library(posterior)
+
+zones <- levels(factor(fit_df$Zone_Name))
+nd <- data.frame(Zone_Name = factor(zones, levels = levels(factor(fit_df$Zone_Name))),
+                 time_ka = 0)
+
+# draws x zones matrix for each nonlinear parameter
+get_par <- function(par) posterior_linpred(fit_time_rfz_3cp, newdata = nd, nlpar = par)
+
+p <- lapply(c("beta1","beta2","beta3","beta4","cp1","cp2","cp3"), get_par)
+names(p) <- c("beta1","beta2","beta3","beta4","cp1","cp2","cp3")
+
+# Slopes (log-rate per ka), oldest -> youngest segments
+# Segment ordering assumes cp1 > cp2 > cp3 (older -> younger)
+slopes <- list(
+  seg_young_of_cp3   = p$beta1,                              # t < cp3
+  seg_cp3_to_cp2     = p$beta1 + p$beta4,                    # cp3 < t < cp2
+  seg_cp2_to_cp1     = p$beta1 + p$beta4 + p$beta3,          # cp2 < t < cp1
+  seg_older_than_cp1 = p$beta1 + p$beta4 + p$beta3 + p$beta2 # t > cp1
+)
+
+summ <- function(m, name) {
+  data.frame(
+    Zone_Name = zones,
+    quantity  = name,
+    mean   = colMeans(m),
+    median = apply(m, 2, median),
+    lower  = apply(m, 2, quantile, 0.025),
+    upper  = apply(m, 2, quantile, 0.975)
+  )
+}
+
+cp_summary <- bind_rows(
+  summ(p$cp1, "CP1 (Robberg/Oakhurst)"),
+  summ(p$cp2, "CP2 (Oakhurst/Wilton)"),
+  summ(p$cp3, "CP3 (Wilton/final LSA)")
+)
+
+slope_summary <- bind_rows(lapply(names(slopes), function(n) summ(slopes[[n]], n)))
+
+# Slope before/after each change point (younger vs older side), plus % change per ka
+ba <- list(
+  CP3_younger = slopes$seg_young_of_cp3,   CP3_older = slopes$seg_cp3_to_cp2,
+  CP2_younger = slopes$seg_cp3_to_cp2,     CP2_older = slopes$seg_cp2_to_cp1,
+  CP1_younger = slopes$seg_cp2_to_cp1,     CP1_older = slopes$seg_older_than_cp1
+)
+ba_summary <- bind_rows(lapply(names(ba), function(n) summ(ba[[n]], n)))
+pct_summary <- bind_rows(lapply(names(ba), function(n) summ(exp(ba[[n]]) - 1, paste0(n, "_pct"))))
+
+# Slope change at each CP (just the hinge coefficient), with P(change > 0)
+change_summary <- bind_rows(
+  summ(p$beta4, "slope change at CP3"),
+  summ(p$beta3, "slope change at CP2"),
+  summ(p$beta2, "slope change at CP1")
+)
+pd <- c(CP3 = colMeans(p$beta4 > 0), CP2 = colMeans(p$beta3 > 0), CP1 = colMeans(p$beta2 > 0))
+
+print(change_summary)
+```
+
+```{r}
+zones <- levels(factor(fit_df_taph$Zone_Name))
+nd <- data.frame(Zone_Name = factor(zones, levels = levels(factor(fit_df_taph$Zone_Name))),
+                 time_ka = 0)
+
+# draws x zones matrix for each nonlinear parameter
+get_par <- function(par) posterior_linpred(fit_time_rfz_3cp_taph, newdata = nd, nlpar = par)
+
+p <- lapply(c("beta1","beta2","beta3","beta4","cp1","cp2","cp3"), get_par)
+names(p) <- c("beta1","beta2","beta3","beta4","cp1","cp2","cp3")
+
+# Slopes (log-rate per ka), oldest -> youngest segments
+# Segment ordering assumes cp1 > cp2 > cp3 (older -> younger)
+slopes <- list(
+  seg_young_of_cp3   = p$beta1,                              # t < cp3
+  seg_cp3_to_cp2     = p$beta1 + p$beta4,                    # cp3 < t < cp2
+  seg_cp2_to_cp1     = p$beta1 + p$beta4 + p$beta3,          # cp2 < t < cp1
+  seg_older_than_cp1 = p$beta1 + p$beta4 + p$beta3 + p$beta2 # t > cp1
+)
+
+summ <- function(m, name) {
+  data.frame(
+    Zone_Name = zones,
+    quantity  = name,
+    mean   = colMeans(m),
+    median = apply(m, 2, median),
+    lower  = apply(m, 2, quantile, 0.025),
+    upper  = apply(m, 2, quantile, 0.975)
+  )
+}
+
+cp_summary <- bind_rows(
+  summ(p$cp1, "CP1 (Robberg/Oakhurst)"),
+  summ(p$cp2, "CP2 (Oakhurst/Wilton)"),
+  summ(p$cp3, "CP3 (Wilton/final LSA)")
+)
+
+slope_summary <- bind_rows(lapply(names(slopes), function(n) summ(slopes[[n]], n)))
+
+# Slope before/after each change point (younger vs older side), plus % change per ka
+ba <- list(
+  CP3_younger = slopes$seg_young_of_cp3,   CP3_older = slopes$seg_cp3_to_cp2,
+  CP2_younger = slopes$seg_cp3_to_cp2,     CP2_older = slopes$seg_cp2_to_cp1,
+  CP1_younger = slopes$seg_cp2_to_cp1,     CP1_older = slopes$seg_older_than_cp1
+)
+ba_summary <- bind_rows(lapply(names(ba), function(n) summ(ba[[n]], n)))
+pct_summary <- bind_rows(lapply(names(ba), function(n) summ(exp(ba[[n]]) - 1, paste0(n, "_pct"))))
+
+# Slope change at each CP (just the hinge coefficient), with P(change > 0)
+change_summary <- bind_rows(
+  summ(p$beta4, "slope change at CP3"),
+  summ(p$beta3, "slope change at CP2"),
+  summ(p$beta2, "slope change at CP1")
+)
+pd <- c(CP3 = colMeans(p$beta4 > 0), CP2 = colMeans(p$beta3 > 0), CP1 = colMeans(p$beta2 > 0))
+
+print(change_summary)
+```
+
+### End Test
+
+```{r}
+draws_rfz_cp3 <- as_draws_df(fit_time_rfz_3cp) %>%
+  mutate(
+    
+    # Summer change points
+    slope_before_cp1_summer =
+      b_beta1_Intercept,
+    
+    slope_after_cp1_summer =
+      b_beta1_Intercept + b_beta2_Intercept,
+    
+    slope_after_cp2_summer =
+      b_beta1_Intercept + b_beta2_Intercept + b_beta3_Intercept,
+    
+    slope_after_cp3_summer =
+      b_beta1_Intercept + b_beta2_Intercept + 
+      b_beta3_Intercept + b_beta4_Intercept,
+    
+    CP1_summer = b_cp1_Zone_NameS,
+    CP2_summer = b_cp2_Zone_NameS,
+    CP3_summer = b_cp3_Zone_NameS,
+    
+    
+    # Winter change points
+    slope_before_cp1_winter =
+      b_beta1_Zone_NameW,
+    
+    slope_after_cp1_winter =
+      b_beta1_Zone_NameW + b_beta2_Zone_NameW ,
+    
+    slope_after_cp2_winter =
+      b_beta1_Zone_NameW + b_beta2_Zone_NameW  + b_beta3_Zone_NameW,
+    
+    slope_after_cp3_winter =
+      b_beta1_Zone_NameW + b_beta2_Zone_NameW  + 
+      b_beta3_Zone_NameW + b_beta4_Zone_NameW,
+    
+    CP1_winter = b_cp1_Zone_NameW,
+    CP2_winter = b_cp2_Zone_NameW,
+    CP3_winter = b_cp3_Zone_NameW,
+    
+    
+    # Yearround change points
+    slope_before_cp1_yearround =
+      b_beta1_Zone_NameY,
+    
+    slope_after_cp1_yearround =
+      b_beta1_Zone_NameY + b_beta2_Zone_NameY ,
+    
+    slope_after_cp2_yearround =
+      b_beta1_Zone_NameY + b_beta2_Zone_NameY  + b_beta3_Zone_NameY,
+    
+    slope_after_cp3_yearround =
+      b_beta1_Zone_NameY + b_beta2_Zone_NameY  + 
+      b_beta3_Zone_NameY + b_beta4_Zone_NameY,
+    
+    CP1_yearround = b_cp1_Zone_NameY,
+    CP2_yearround = b_cp2_Zone_NameY,
+    CP3_yearround = b_cp3_Zone_NameY,
+    
+  )
+
+draws_rfz_cp3 |>
+  select(slope_before_cp1_summer:slope_after_cp3_summer,
+         slope_before_cp1_winter:slope_after_cp3_winter,
+         slope_before_cp1_yearround:slope_after_cp3_yearround) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Slope",
+    values_to = "RFZ"
+  ) %>%
+  group_by(Slope) %>%
+  summarise(
+    estimate = median(RFZ),
+    lower = quantile(RFZ, 0.025),
+    upper = quantile(RFZ, 0.975)
+  ) %>%
+  mutate('Period' = str_split_i(Slope, '_', 2),
+         'Change Point' = str_split_i(Slope, '_', 3),
+         'RFZ' = str_split_i(Slope, '_', 4)) %>%
+  mutate(`Change Point` = ifelse(Period == 'before', 'cp0', `Change Point`)) %>%
+  arrange(`Change Point`) %>%
+  
+  ggplot(aes(x = estimate, y = `Change Point`, color = RFZ))+
+  geom_errorbarh(aes(xmin = lower, xmax = upper),
+                 position = position_dodge(width = 0.9),
+                 width = 0.8)+
+  geom_point(
+    position = position_dodge(width = 0.9)
+    )
+
+
+
+draws_rfz_cp3 |>
+  select(CP1_summer:CP3_summer,
+         CP1_winter:CP3_winter,
+         CP1_yearround:CP3_yearround) |>
+  pivot_longer(
+    everything(),
+    names_to = "ChangePoint",
+    values_to = "cp"
+  ) |>
+  group_by(ChangePoint) |>
+  summarise(
+    estimate = median(cp),
+    lower = quantile(cp, 0.025),
+    upper = quantile(cp, 0.975),
+    
+    calBP_estimate = (-estimate * 1000) + mean(fit_df$calBP),
+    calBP_lwr = (-lower * 1000) + mean(fit_df$calBP),
+    calBP_upr = (-upper * 1000) + mean(fit_df$calBP)
+  ) %>%
+  mutate('Change Point' = str_split_i(ChangePoint, '_', 1),
+         'RFZ' = str_split_i(ChangePoint, '_', 2)) %>%
+  arrange(`Change Point`) %>%
+  
+  ggplot(aes(x = calBP_estimate, y = `Change Point`, color = RFZ))+
+  geom_errorbarh(aes(xmin = calBP_lwr, xmax = calBP_upr),
+                 position = position_dodge(width = 0.9),
+                 width = 0.8)+
+  geom_point(
+    position = position_dodge(width = 0.9)
+  ) +
+  scale_x_reverse()
+```
+
+```{r}
+draws_rfz_cp3_taph <- as_draws_df(fit_time_rfz_3cp_taph) %>%
+  mutate(
+    
+    # Summer change points
+    slope_before_cp1_summer =
+      b_beta1_Intercept,
+    
+    slope_after_cp1_summer =
+      b_beta1_Intercept + b_beta2_Intercept,
+    
+    slope_after_cp2_summer =
+      b_beta1_Intercept + b_beta2_Intercept + b_beta3_Intercept,
+    
+    slope_after_cp3_summer =
+      b_beta1_Intercept + b_beta2_Intercept + 
+      b_beta3_Intercept + b_beta4_Intercept,
+    
+    CP1_summer = b_cp1_Zone_NameS,
+    CP2_summer = b_cp2_Zone_NameS,
+    CP3_summer = b_cp3_Zone_NameS,
+    
+    
+    # Winter change points
+    slope_before_cp1_winter =
+      b_beta1_Zone_NameW,
+    
+    slope_after_cp1_winter =
+      b_beta1_Zone_NameW + b_beta2_Zone_NameW ,
+    
+    slope_after_cp2_winter =
+      b_beta1_Zone_NameW + b_beta2_Zone_NameW  + b_beta3_Zone_NameW,
+    
+    slope_after_cp3_winter =
+      b_beta1_Zone_NameW + b_beta2_Zone_NameW  + 
+      b_beta3_Zone_NameW + b_beta4_Zone_NameW,
+    
+    CP1_winter = b_cp1_Zone_NameW,
+    CP2_winter = b_cp2_Zone_NameW,
+    CP3_winter = b_cp3_Zone_NameW,
+    
+    
+    # Yearround change points
+    slope_before_cp1_yearround =
+      b_beta1_Zone_NameY,
+    
+    slope_after_cp1_yearround =
+      b_beta1_Zone_NameY + b_beta2_Zone_NameY ,
+    
+    slope_after_cp2_yearround =
+      b_beta1_Zone_NameY + b_beta2_Zone_NameY  + b_beta3_Zone_NameY,
+    
+    slope_after_cp3_yearround =
+      b_beta1_Zone_NameY + b_beta2_Zone_NameY  + 
+      b_beta3_Zone_NameY + b_beta4_Zone_NameY,
+    
+    CP1_yearround = b_cp1_Zone_NameY,
+    CP2_yearround = b_cp2_Zone_NameY,
+    CP3_yearround = b_cp3_Zone_NameY,
+    
+  )
+
+draws_rfz_cp3_taph |>
+  select(slope_before_cp1_summer:slope_after_cp3_summer,
+         slope_before_cp1_winter:slope_after_cp3_winter,
+         slope_before_cp1_yearround:slope_after_cp3_yearround) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Slope",
+    values_to = "RFZ"
+  ) %>%
+  group_by(Slope) %>%
+  summarise(
+    estimate = median(RFZ),
+    lower = quantile(RFZ, 0.025),
+    upper = quantile(RFZ, 0.975)
+  ) %>%
+  mutate('Period' = str_split_i(Slope, '_', 2),
+         'Change Point' = str_split_i(Slope, '_', 3),
+         'RFZ' = str_split_i(Slope, '_', 4)) %>%
+  mutate(`Change Point` = ifelse(Period == 'before', 'cp0', `Change Point`)) %>%
+  arrange(`Change Point`) %>%
+  
+  ggplot(aes(x = estimate, y = `Change Point`, color = RFZ))+
+  geom_errorbarh(aes(xmin = lower, xmax = upper),
+                 position = position_dodge(width = 0.9),
+                 width = 0.8)+
+  geom_point(
+    position = position_dodge(width = 0.9)
+  ) 
+
+
+
+draws_rfz_cp3_taph |>
+  select(CP1_summer:CP3_summer,
+         CP1_winter:CP3_winter,
+         CP1_yearround:CP3_yearround) |>
+  pivot_longer(
+    everything(),
+    names_to = "ChangePoint",
+    values_to = "cp"
+  ) |>
+  group_by(ChangePoint) |>
+  summarise(
+    estimate = median(cp),
+    lower = quantile(cp, 0.025),
+    upper = quantile(cp, 0.975),
+    
+    calBP_estimate = (-estimate * 1000) + mean(fit_df$calBP),
+    calBP_lwr = (-lower * 1000) + mean(fit_df$calBP),
+    calBP_upr = (-upper * 1000) + mean(fit_df$calBP)
+  ) %>%
+  mutate('Change Point' = str_split_i(ChangePoint, '_', 1),
+         'RFZ' = str_split_i(ChangePoint, '_', 2)) %>%
+  arrange(`Change Point`) %>%
+  
+  ggplot(aes(x = calBP_estimate, y = `Change Point`, color = RFZ))+
+  geom_errorbarh(aes(xmin = calBP_lwr, xmax = calBP_upr),
+                 position = position_dodge(width = 0.9),
+                 width = 0.8)+
+  geom_point(
+    position = position_dodge(width = 0.9)
+  ) +
+  scale_x_reverse()
+```
+
+## Site count VS site type
+
+```{r}
+{r}
+fit_df <- za_df %>%
+  group_by(calBP, SiteType) %>%
+  summarize(
+    site_count = sum(count, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    median_calBP = calBP,
+    time_ka = -(calBP - mean(calBP, na.rm = TRUE)) / 1000
+  )
+
+fit_df_taph <- za_df_taph %>%
+  group_by(calBP, SiteType) %>%
+  summarize(
+    site_count = sum(count, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    median_calBP = calBP,
+    time_ka = -(calBP - mean(calBP, na.rm = TRUE)) / 1000
+  )
+
+
+
+png(paste0(dir, "/results/figures/map5.png"), 
+    width = 1200, height = 800, res = 300)
+
+fit_df %>%
+  ggplot(aes(x = calBP, y = site_count, fill = site_count))+
+  geom_line() +
+  #scale_fill_gradient(low = "darkorange", high = "darkblue") +
+  facet_wrap(~SiteType) +
+  xlab("Calibrated Years BP")+
+  scale_x_reverse() +
+  theme_minimal(base_size = 8)+
+  theme(axis.text.x = element_text(angle = 45,  hjust = 1))
+
+dev.off()
+
+
+png(paste0(dir, "/results/figures/map6.png"), 
+    width = 1200, height = 800, res = 300)
+
+fit_df_taph %>%
+  ggplot(aes(x = calBP, y = site_count, fill = site_count))+
+  geom_line() +
+  #scale_fill_gradient(low = "darkorange", high = "darkblue") +
+  facet_wrap(~SiteType) +
+  xlab("Calibrated Years BP")+
+  scale_x_reverse() +
   theme_minimal(base_size = 8)+
   theme(axis.text.x = element_text(angle = 45,  hjust = 1))
 
 dev.off()
 ```
 
-## Bayesian Modeling
+### Change Points
 
 ```{r}
-
-# this model shows cluster show almost no variation after accounting for mean site count
-#seed <- seed + 1
-seed <- 8
-fit_time <- brm(
-  site_count ~
-    1 + time_ka,
-  
-  family = negbinomial(),
-  
-  data = fit_df,
-  
-  prior = c(
-    prior(normal(0, 2), class = "Intercept")
-  ),
-  
-  chains = 1,
-  iter = 4000,
-  warmup = 2000,
-  
-  control = list(
-    adapt_delta = 0.95
-  ),
-  
-  cores = 4,
-  threads = threading(8),
-  backend = 'cmdstanr',
-  seed = seed
-)
-
-seed <- 9
-fit_time2 <- brm(
-  site_count ~
-    1 + time_ka + (1  + time_ka | Tech),
-  
-  family = negbinomial(),
-  
-  data = fit_df,
-  
-  prior = c(
-    prior(normal(0, 2), class = "Intercept")
-  ),
-  
-  chains = 1,
-  iter = 4000,
-  warmup = 2000,
-  
-  control = list(
-    adapt_delta = 0.95
-  ),
-  
-  cores = 4,
-  threads = threading(8),
-  backend = 'cmdstanr',
-  seed = seed
-)
-
-
-```
-
-# Results
-
-## Hypotheses
-
-### $H_1$: ***Rates of radiocarbon intensity vary between archaeological sites in southern Africa.***
-
-### $H_2$: ***Periods that correspond to the technological industries will show different rates of radiocarbon intensity based on varying population sizes.***
-
-#### $H_{2a}$: The period associated with Robberg technology will show reduced radiocarbon intensity compared with the Oakhurst, Wilton, and Post-Wilton technological periods.
-
-#### $H_{2b}$: The period associated with Oakhurst technology should show higher radiocarbon intensity rates than the Robberg technological period.
-
-#### $H_{2c}$: The period associated with Wilton technology should show lower radiocarbon intensity rates than the Oakhurst technological period.
-
-#### $H_{2D}$: The period associated with Post-Wilton technology should show higher radiocarbon intensity rates than the Wilton technological period.
-
-### $H_3$: ***Radiocarbon intensity for technological periods associated with greater population sizes will have regional-distinct patterns but will be regionally similar during periods with low population sizes.***
-
-#### $H_{3a}$: During the Robberg period, regional radiocarbon intensity will be similar across southern Africa.
-
-#### $H_{3B}$: During the Oakhurst period, regional radiocarbon intensity will be different across southern Africa.
-
-#### $H_{3C}$: During the Wilton period, regional radiocarbon intensity will be similar across southern Africa.
-
-#### $H_{3D}$: During the Post-Wilton period, regional radiocarbon intensity will be different across southern Africa.
-
-## Results
-
-### 1) Do rates of radiocarbon intensity vary through time in southern Africa?
-
-Yes, the radiocarbon intensity increases exponentially towards the present. The mean rate is 0.96 for Robberg period, 9.63 for the Oakhurst period, 31.4 for the WIlton period, and 78.5 for the Final LSA period.
-
-```{r}
-# compute posterior slope estimates for the first model including time
-time_mean <- mean(fit_df$calBP, na.rm = TRUE)
-
-prediction_grid <- expand_grid(
-  calBP = seq(min_age, max_age, by = 1000)
-) |>
-  mutate(time_ka = -(calBP - time_mean)/1000)
-
-
-
-draws <- posterior_epred(
-  fit_time,
-  newdata = prediction_grid
-  ) |>
-  as_tibble() |>
-  rename_with(
-    .fn = ~ paste0(unique(prediction_grid$calBP)),
-    .cols = starts_with('V')
-  ) |>
-  pivot_longer(
-    cols = '2000':'21000',
-    values_to = 'estimate',
-    names_to = 'time'
-  ) |>
-  mutate(time = as.numeric(time)) |>
-  group_by(time) |>
-  
-  summarise(
-    slope = median(estimate),
-    lower = quantile(estimate, 0.05),
-    upper = quantile(estimate, 0.95),
-    
-    .groups = "drop"
-  )
-```
-
-```{r}
-png(paste0(dir, "/results/figures/fig4B.png"), 
-    width = 1200, height = 800, res = 300)
-
-draws |>
-  ggplot(aes(x = time, y = slope)) +
-  geom_smooth(method = "loess", se = TRUE, span = 0.75) +
-  scale_x_reverse() +
-  
-  annotate("rect", xmin = 19923, xmax = 13145, ymin = -Inf, ymax = Inf,
-           fill = "blue", alpha = 0.2) +
-  annotate("text", x = (19923+13145)/2, y = 25, label = "Robberg", 
-           color = "blue", fontface = "bold", vjust = 4, size = 3) +
-  
-  annotate("rect", xmin = 12789, xmax = 8705, ymin = -Inf, ymax = Inf,
-           fill = "forestgreen", alpha = 0.2) +
-  annotate("text", x = (12789+8705)/2, y = 25, label = "Oakhurst", 
-            color = "forestgreen", fontface = "bold", vjust = 4, size = 3) +
-  
-  annotate("rect", xmin = 7784, xmax = 4636, ymin = -Inf, ymax = Inf,
-           fill = "orange", alpha = 0.2) +
-  annotate("text", x = (7784+4636)/2, y = 25, label = "Wilton", 
-            color = "orange", fontface = "bold", vjust = 4, size = 3) +
-  
-  annotate("rect", xmin = 3898, xmax = 1318, ymin = -Inf, ymax = Inf,
-           fill = "gold", alpha = 0.2) +
-  annotate("text", x = (3898+1318)/2, y = 19, label = "Final\nLSA", 
-            color = "gold", fontface = "bold", vjust = 1.5, size = 3) +
-  
-  
-  ylab("Rate of Radiocarbon Intesnity/1,000 years") +
-  xlab("Time (yrs cal BP)") +
-  theme_minimal()
-
-dev.off()
-```
-
-### 2) Do rates of radiocarbon intensity vary through time and technological classification in southern Africa?
-
-No, a pairwise comparison shows that the assigned technological classes do not change through time within southern Africa. This is likely because the actual classifications begin prior to and after the proposed temporal interval Lombard et al. (2022) assigned.
-
-```{r}
-# compute posterior slope estimates for each cluster
-time_mean <- mean(fit_df$calBP, na.rm = TRUE)
-
-prediction_grid <- expand_grid(
-  calBP = seq(min_age, max_age, by = 1000),
-  Tech = unique(fit_df$Tech)
-) |>
-  mutate(time_ka = -(calBP - time_mean)/1000) |>
-  filter(!is.na(Tech))
-
-draws <- posterior_epred(
-  fit_time2,
-  newdata = prediction_grid
-)  |>
-  as_tibble() |>
-  rename_with(
-    .fn = ~ unique(paste0(prediction_grid$calBP, "_", 
-                          prediction_grid$Tech)),
-    .cols = starts_with('V')
-  ) |>
-  pivot_longer(
-    cols = everything(),
-    values_to = 'estimate',
-    names_to = 'time'
-  ) |>
-  separate_wider_delim(
-    cols = time, 
-    delim = "_", 
-    names = c("time", "tech")
-  ) |>
-  mutate(time = as.numeric(time)) |>
-  group_by(time, tech) |>
-  
-  summarise(
-    slope = median(estimate),
-    lower = quantile(estimate, 0.05),
-    upper = quantile(estimate, 0.95),
-    
-    .groups = "drop"
-  ) 
-
-png(paste0(dir, "/results/figures/fig5.png"), 
-    width = 1200, height = 800, res = 300)
-
-draws |>
-  filter(tech != 'Ceramic LSA') |>
-  mutate(tech = factor(tech, 
-                          levels = c('Robberg', 'Oakhurst',
-                                     'Wilton', 'Final LSA'))) |>
-  
-  ggplot(aes(x = time, y = slope)) +
-  geom_smooth(method = "loess", se = TRUE, span = 0.75) +
-  scale_x_reverse() +
-  
-  annotate("rect", xmin = 19923, xmax = 13145, ymin = -Inf, ymax = Inf,
-           fill = "blue", alpha = 0.2) +
-  annotate("text", x = (19923+13145)/2, y = 25, label = "Robberg", 
-           color = "blue", fontface = "bold", vjust = -0.5, size = 1.5) +
-  
-  annotate("rect", xmin = 12789, xmax = 8705, ymin = -Inf, ymax = Inf,
-           fill = "forestgreen", alpha = 0.2) +
-  annotate("text", x = (12789+8705)/2, y = 25, label = "Oakhurst", 
-           color = "forestgreen", fontface = "bold", vjust = -0.5, size = 1.5) +
-  
-  annotate("rect", xmin = 7784, xmax = 4636, ymin = -Inf, ymax = Inf,
-           fill = "orange", alpha = 0.2) +
-  annotate("text", x = (7784+4636)/2, y = 25, label = "Wilton", 
-           color = "orange", fontface = "bold", vjust = -0.5, size = 1.5) +
-  
-  annotate("rect", xmin = 3898, xmax = 1318, ymin = -Inf, ymax = Inf,
-           fill = "gold", alpha = 0.2) +
-  annotate("text", x = (3898+1318)/2, y = 19, label = "Final\nLSA", 
-           color = "gold", fontface = "bold", vjust = -0.5, size = 1.5) +
-  
-  facet_wrap(~tech, scales = 'free') +
-  
-  
-  ylab("Rate of Radiocarbon Intesnity/1,000 years") +
-  xlab("Time (yrs cal BP)") +
-  theme_minimal()
-
-dev.off()
-```
-
-```{r}
-# examine the radiocarbon rate by technology
-draws_tech <- posterior_epred(
-  fit_time2,
-  newdata = prediction_grid
-)  |>
-  as_tibble() |>
-  rename_with(
-    .fn = ~ unique(paste0(prediction_grid$calBP, "_", 
-                          prediction_grid$Tech)),
-    .cols = starts_with('V')
-  ) |>
-  pivot_longer(
-    cols = everything(),
-    values_to = 'estimate',
-    names_to = 'time'
-  ) |>
-  separate_wider_delim(
-    cols = time, 
-    delim = "_", 
-    names = c("time", "tech")
-  ) |>
-  mutate(time = as.numeric(time),
-         tech = as.factor(tech)) |>
-  group_by(tech) |>
-  #filter(time <7784) |> # filter this for the wilton and final LSA comparison
-  
-  summarise(
-    slope = median(estimate),
-    lower = quantile(estimate, 0.05),
-    upper = quantile(estimate, 0.95),
-    
-    .groups = "drop"
-  ) 
-
-
-# examine the radiocarbon rate by period
-draws_period <- posterior_epred(
-  fit_time2,
-  newdata = prediction_grid
-)  |>
-  as_tibble() |>
-  rename_with(
-    .fn = ~ unique(paste0(prediction_grid$calBP, "_", 
-                          prediction_grid$Tech)),
-    .cols = starts_with('V')
-  ) |>
-  pivot_longer(
-    cols = everything(),
-    values_to = 'estimate',
-    names_to = 'time'
-  ) |>
-  separate_wider_delim(
-    cols = time, 
-    delim = "_", 
-    names = c("time", "tech")
-  ) |>
-  mutate(time = as.numeric(time),
-         
-         period = ifelse(time > 13000, 'Robberg',
-                         ifelse(time > 8000, 'Oakhurst',
-                                ifelse(time > 4000, 'Wilton',
-                                       ifelse(time > 1300, 'Final LSA',
-                                              'Ceramic LSA')))),
-         tech = factor(tech)) |>
-  group_by(period) |>
-  
-  summarise(
-    slope = median(estimate),
-    lower = quantile(estimate, 0.05),
-    upper = quantile(estimate, 0.95),
-    
-    .groups = "drop"
-  ) 
-
-# examine the radiocarbon rate bewtween time period and tehnology
-
-draws_tech_period <- posterior_epred(
-  fit_time2,
-  newdata = prediction_grid
-)  |>
-  as_tibble() |>
-  rename_with(
-    .fn = ~ unique(paste0(prediction_grid$calBP, "_", 
-                          prediction_grid$Tech)),
-    .cols = starts_with('V')
-  ) |>
-  pivot_longer(
-    cols = everything(),
-    values_to = 'estimate',
-    names_to = 'time'
-  ) |>
-  separate_wider_delim(
-    cols = time, 
-    delim = "_", 
-    names = c("time", "tech")
-  ) |>
-  mutate(time = as.numeric(time),
-         
-         period = ifelse(time > 13000, 'Robberg',
-                         ifelse(time > 8000, 'Oakhurst',
-                                ifelse(time > 4000, 'Wilton',
-                                       ifelse(time > 1300, 'Final LSA',
-                                              'Ceramic LSA')))),
-         tech = factor(tech)) |>
-  group_by(tech, period) |>
-  
-  summarise(
-    slope = median(estimate),
-    lower = quantile(estimate, 0.05),
-    upper = quantile(estimate, 0.95),
-    
-    .groups = "drop"
-  ) 
-
-
-
-```
-
-```{r}
-ep <- posterior_epred(
-  fit_time2,
-  newdata = prediction_grid
-) |> 
-  as_tibble() |>
-  mutate(draw = row_number()) |>
-  pivot_longer(
-    cols = -draw,
-    names_to = "pred_id",
-    values_to = "estimate"
-  ) |>
-  mutate(
-    pred_id = as.integer(sub("V", "", pred_id)),
-    time = prediction_grid$calBP[pred_id],
-    tech = prediction_grid$Tech[pred_id]
-  ) |>
-  mutate(
-    time = as.numeric(time),
-    tech = factor(tech)
-  ) |>
-  pivot_wider(
-    id_cols = c(draw, time),
-    names_from = tech,
-    values_from = estimate
-  )
-
-# Evaluate the probability that the radiocarbon intensity rates are different between technological classifications
-ep |>
-  summarize(`Robberg > Oakhurst` = mean(Robberg > Oakhurst),
-            `Oakhurst > Wilton` = mean(Oakhurst > Wilton),
-            `Wilton > Final LSA` = mean(Wilton > `Final LSA`),
-            
-            `Robberg > Wilton` = mean(Robberg > `Wilton`))
-```
-
-### 3) Do different technological periods correspond to different radiocarbon intensities across southern African regions?
-
-Yes, of particular interest is the fact that the interior-karoo radiocarbon intensity increases into the later Holocene, suggesting a continuous occupation of this region during the middle and later Holocene despoit previous predictions. However, the pattern is much different when we consider the radiocarbon intensity associated to sites assigned to distinct technological classifications.
-
-In particular, though the interior-karoo was significantly different between the Robberg and Oakhurst period (19 ka cal BP - 8.7 ka cal BP), there is no significant difference bewteen radiocarbon intensity and the sites that show Robberg and Oakhurst technologies. However, Wilton technology has a higher rate of radiocarbon intensity within the interior-karoo, implying greater population around sites associated with wilton technology in the interior-karoo. The final LSA also has a lower rate in the interior-karoo than does wilton technology. Given the graphic, this is the general trend for all of southern Africa.
-
-**In conclusion, the technological patterns show homogeneous patterns through southern Africa whereas the temporal trends show significant differences across southern Africa.** Each period shows a monotonic increase in radiocarbon intensity through time, but Africa is regionally distinct over specific periods of time, which the technological trends do not track.
-
-```{r}
-# combine clustered data from SASSI to the SARD database
-df_tmp <- za_holocene |>
-  full_join(clustered_data |> 
-              st_drop_geometry() |> 
-              select(Site, cluster) |>
-              distinct(), by = "Site") |>
-  filter(!is.na(cluster))
-
-fit_df <- df_tmp |>
-  st_drop_geometry() |>
-  rename(site_count = count,
-         Tech = `Archaeological Sub-chronology`) |>
-  group_by(cluster, calBP) |>
-  mutate(cluster_dates = n()) |>
-  ungroup() |>
-  
-  mutate(time_s = as.numeric(scale(calBP)),
-         time_red = calBP/1000,
-         time_ka = -(calBP - mean(calBP, na.rm = TRUE))/1000,
-         
-         cluster_fct = factor(cluster),
-         cluster_num = as.numeric(cluster),
-         cluster_cat = ifelse(cluster %in% c(9, 2), 'Northwest Coast',
-                              ifelse(cluster %in% c(8, 7, 6), 'Northeast',
-                                     ifelse(cluster %in% c(5), 'Interior-Karoo',
-                                            ifelse(cluster %in% c(3), 'Interior-Grassland',
-                                                   ifelse(cluster == 4, 'East Coast', 'Southern Coast'))))),
-         
-         Tech = ifelse(str_detect(Tech, 'Iron'), 'Ceramic LSA', Tech),
-         
-         iter = iter) |>
-  filter(Tech != 'ELSA', Tech != 'Final MSA')
-
-
-png(paste0(dir, "/results/figures/fig2A_right.png"), 
-    width = 1200, height = 800, res = 300)
-
-ggplot()+
-  geom_sf(data = africa_map, fill = "antiquewhite", color = "darkgray") +
-  geom_sf(data = df_tmp, aes(color = factor(cluster)), size = 0.45) +
-  geom_mark_hull(alpha = 0.2, expand = unit(3, "mm")) +
-  scale_color_discrete(name = "Cluster",
-                       labels = c(
-                         '1' = '1 - Southern Coast',
-                         
-                         '2' = '2 - Northwest Coast',
-                         '9' = '9 - Northwest Coast',
-                         
-                         '3' = '3 - Interior Grassland',
-                         
-                         '4' = '4 - East Coast',
-                         
-                         '5' = '5 - Interior Karoo',
-                         
-                         '6' = '6 - Northeast',
-                         '7' = '7 - Northeast',
-                         '8' = '8 - Northeast'
-                       )) +
-  coord_sf(xlim = c(10, 42), ylim = c(-35, -10), expand = FALSE) +
-  theme_minimal()+
-  theme(axis.text = element_text(size = 3),
-        axis.title = element_text(size = 3),
-        strip.text = element_text(size = 4),
-        
-        legend.title = element_text(size = 5),
-        legend.text = element_text(size = 4))
-
-dev.off()
-```
-
-```{r}
-############################################################
-#seed <- seed + 1
-seed <- 10
-fit_space_h3 <- brm(
-  site_count ~
-    1 + time_ka + (0 + time_ka || cluster_cat),
-  
-  family = negbinomial(),
-  
-  data = fit_df,
-  
-  prior = c(
-    prior(normal(0, 2), class = "Intercept")
-  ),
-  
-  chains = 1,
-  iter = 4000,
-  warmup = 2000,
-  
-  control = list(
-    adapt_delta = 0.95
-  ),
-  
-  cores = 4,
-  threads = threading(8),
-  backend = 'cmdstanr',
-  seed = seed
-)
-
-
-############################################################
-#seed <- seed + 1
-seed <- 11
-fit_space_h4 <- brm(
-  site_count ~
-    1 + time_ka + (1 + time_ka | Tech) + (0 + time_ka || cluster_cat),
-  
-  family = negbinomial(),
-  
-  data = fit_df,
-  
-  prior = c(
-    prior(normal(0, 2), class = "Intercept")
-  ),
-  
-  chains = 1,
-  iter = 4000,
-  warmup = 2000,
-  
-  control = list(
-    adapt_delta = 0.95
-  ),
-  
-  cores = 4,
-  threads = threading(8),
-  backend = 'cmdstanr',
-  seed = seed
-)
-```
-
-```{r}
-# Compare age ranges
-intervals <- tribble(
-  ~period, ~start, ~end,
-  "Robberg", 13145, 19923,
-  "Oakhurst",   8705, 12789,
-  "Wilton",    4636,  7784,
-  "Final LSA", 1318, 3898
-) |>
-  mutate(period = as.factor(period),
-         period = fct_relevel(period, c('Robberg', 'Oakhurst', 'Wilton',
-                                        'Final LSA')))
-
-
-time_mean <- mean(fit_df$calBP, na.rm = TRUE)
-
-interval_grid <- crossing(
-  intervals,
-  cluster_cat = unique(fit_df$cluster_cat),
-  calBP = seq(1000, 21000, by = 500)
-) |>
-  filter(
-    calBP >= pmin(start, end),
-    calBP <= pmax(start, end)
-  ) |>
-  mutate(
-    time_ka = -(calBP - time_mean)/1000
-  )
-
-interval_pred <- posterior_epred(
-  fit_space_h3,
-  newdata = interval_grid,
-  re_formula = NULL
-)
-
-
-pred_long <- interval_grid |>
-  select(period, cluster_cat, calBP) |>
-  bind_cols(
-    as.data.frame(t(interval_pred))
-  ) |>
-  pivot_longer(
-    cols = starts_with("V"),
-    names_to = "draw",
-    values_to = "mu"
-  )
-
-# caculate expectations
-interval_summary <- pred_long |>
-  group_by(period, cluster_cat, draw) |>
-  mutate(period = as.factor(period)) |> 
-  summarise(
-    mean_count = mean(mu),
-    .groups = "drop"
-  ) |>
-  group_by(period, cluster_cat) |>
-  summarise(
-    estimate = median(mean_count),
-    lower = quantile(mean_count, 0.05),
-    upper = quantile(mean_count, 0.95),
-    .groups = "drop"
-  )
-
-png(paste0(dir, "/results/figures/fig6.png"), 
-    width = 2400, height = 1600, res = 300)
-
-interval_summary |>
-  
-  ggplot(aes(x = cluster_cat, y = estimate)) +
-  geom_point(size = 3) +
-  geom_errorbar(
-    aes(ymin = lower, ymax = upper),
-    width = 0.15
-  ) +
-  facet_wrap(~period, scales = "free_y") +
-  ylab("Radiocarbon Intensity") +
-  xlab("Regional Aggregate") +
-  theme_minimal()+
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
-    
-dev.off()
-
-
-
-interval_summary |>
-  
-  ggplot(aes(x = period, y = estimate)) +
-  geom_point(size = 3) +
-  geom_errorbar(
-    aes(ymin = lower, ymax = upper),
-    width = 0.15
-  ) +
-  facet_wrap(~cluster_cat, scales = "free_y") +
-  ylab("Radiocarbon Intensity") +
-  xlab("Regional Aggregate") +
-  theme_minimal()+
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  ) 
-
-```
-
-```{r}
-
-draws <- as_draws_df(fit_space_h3)
-
-slope_draws <- draws |>
-  select(
-    .draw,
-    b_time_ka,
-    starts_with("r_cluster_cat[")
-  ) |>
-  pivot_longer(
-    cols = starts_with("r_cluster_cat["),
-    names_to = "cluster",
-    values_to = "slope_deviation"
-  ) |>
-  mutate(
-    cluster_slope = b_time_ka + slope_deviation,
-    cluster = str_extract(cluster, "(?<=\\[)[^,]+")
-  )  
-
-
-slope_pairs <- combn(
-  unique(slope_draws$cluster),
-  2,
-  simplify = FALSE
-)
-
-pairwise_slopes <- map_dfr(
-  slope_pairs,
-  \(x) {
-    
-    diff <- slope_draws |>
-      filter(cluster %in% x) |>
-      select(.draw, cluster, cluster_slope) |>
-      pivot_wider(
-        names_from = cluster,
-        values_from = cluster_slope
-      ) |>
-      mutate(
-        difference = .data[[x[1]]] - .data[[x[2]]]
-      ) |>
-      pull(difference)
-    
-    tibble(
-      cluster_1 = x[1],
-      cluster_2 = x[2],
-      estimate = median(diff),
-      lower = quantile(diff, 0.025),
-      upper = quantile(diff, 0.975),
-      prob_cluster1_greater = mean(diff > 0),
-      
-      # optional: ratio of temporal rate multipliers
-      rate_ratio = median(exp(diff)),
-      rate_ratio_lower = quantile(exp(diff), 0.025),
-      rate_ratio_upper = quantile(exp(diff), 0.975)
-    )
+# Global change point
+hinge_fun <- stanvar(
+  scode = "
+  real hinge(real x, real cp) {
+    return fmax(0, x - cp);
   }
+  ",
+  block = "functions"
 )
 
-pairwise_slopes |>
-  filter(lower > 0 | upper < 0)
+
+# Three change points per region
+model_fit_site_3cp <- bf(
+  site_count ~ alpha +
+    beta1 * time_ka +
+    beta2 * hinge(time_ka, cp1) +
+    beta3 * hinge(time_ka, cp2) +
+    beta4 * hinge(time_ka, cp3),
+  
+  alpha ~ 1,
+  beta1 ~ 1 + Zone_Name,
+  beta2 ~ 1 + Zone_Name,
+  beta3 ~ 1 + Zone_Name,
+  beta4 ~ 1 + Zone_Name,
+  
+  cp1 ~ 0 + Zone_Name,
+  cp2 ~ 0 + Zone_Name,
+  cp3 ~ 0 + Zone_Name,
+  
+  nl = TRUE
+)
+
+
+prior_fit_site_3cp <- c(
+  
+  # baseline
+  prior(
+    normal(0, 1),
+    class = "b",
+    nlpar = "alpha"
+  ),
+  
+  # initial slope
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta1"
+  ),
+  
+  # slope change at CP1
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta2"
+  ),
+  
+  # additional slope change at CP2
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta3"
+  ),
+  
+  # additional slope change at CP3
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta4"
+  ),
+  
+  # CP1
+  # third change point from Robberg to Oakhurst
+  prior(
+    normal(12, 0.5),
+    class = "b",
+    nlpar = "cp1"
+  ),
+  
+  # CP2
+  # second change point from Oakhurst to wilton
+  prior(
+    normal(6.3, 0.5),
+    class = "b",
+    nlpar = "cp2"
+  ),
+  
+  # CP3
+  # last change point from Wilton to final LSA
+  prior(
+    normal(2.12, 2),
+    class = "b",
+    nlpar = "cp3"
+  )
+)
+
+seed <- seed + 1
+
+fit_time_site_3cp <- brm(
+  model_fit_site_3cp,
+  data = fit_df,
+  family = zero_inflated_poisson(),
+  prior = prior_fit_site_3cp,
+  
+  stanvars = hinge_fun,
+  
+  chains = 2,
+  iter = 1000,
+  warmup = 500,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed,
+  
+  sample_prior = 'yes'
+)
+
+
+seed <- seed + 1
+
+fit_time_rfz_3cp_taph <- brm(
+  model_fit_rfz_3cp,
+  data = fit_df_taph,
+  family = zero_inflated_poisson(),
+  prior = prior_fit_rfz_3cp,
+  
+  stanvars = hinge_fun,
+  
+  chains = 2,
+  iter = 1000,
+  warmup = 500,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed,
+  
+  sample_prior = 'yes'
+)
+
 ```
 
 ```{r}
-# Compare age ranges
-intervals <- tribble(
-  ~period, ~start, ~end,
-  "Robberg", 13145, 19923,
-  "Oakhurst",   8705, 12789,
-  "Wilton",    4636,  7784,
-  "Final LSA", 1318, 3898
-) |>
-  mutate(period = as.factor(period),
-         period = fct_relevel(period, c('Robberg', 'Oakhurst', 'Wilton',
-                                        'Final LSA')))
+loo3 <- loo(fit_time_site)
+loo4 <- loo(fit_time_site_rfz)
 
-
-time_mean <- mean(fit_df$calBP, na.rm = TRUE)
-
-interval_grid <- crossing(
-  intervals,
-  cluster_cat = unique(fit_df$cluster_cat),
-  Tech = unique(fit_df$Tech),
-  calBP = seq(1000, 21000, by = 500)
-) |>
-  filter(
-    calBP >= pmin(start, end),
-    calBP <= pmax(start, end)
-  ) |>
-  mutate(
-    time_ka = -(calBP - time_mean)/1000
-  )
-
-interval_pred <- posterior_epred(
-  fit_space_h4,
-  newdata = interval_grid,
-  re_formula = NULL
-)
-
-
-pred_long <- interval_grid |>
-  select(cluster_cat, Tech, calBP) |>
-  bind_cols(
-    as.data.frame(t(interval_pred))
-  ) |>
-  pivot_longer(
-    cols = starts_with("V"),
-    names_to = "draw",
-    values_to = "mu"
-  )
-
-# caculate expectations
-interval_summary <- pred_long |>
-  group_by(Tech, cluster_cat, draw) |>
-  mutate(Tech = as.factor(Tech),
-         Tech = fct_relevel(Tech, c('Robberg', 'Oakhurst', 'Wilton',
-                                        'Final LSA'))) |> 
-  summarise(
-    mean_count = mean(mu),
-    .groups = "drop"
-  ) |>
-  group_by(Tech, cluster_cat) |>
-  summarise(
-    estimate = median(mean_count),
-    lower = quantile(mean_count, 0.05),
-    upper = quantile(mean_count, 0.95),
-    .groups = "drop"
-  )
-
-
-
-interval_summary |>
-  filter(Tech != 'Ceramic LSA') |>
-  
-  ggplot(aes(x = Tech, y = estimate)) +
-  geom_point(size = 3) +
-  geom_errorbar(
-    aes(ymin = lower, ymax = upper),
-    width = 0.15
-  ) +
-  facet_wrap(~cluster_cat, scales = "free") +
-  ylab("Radiocarbon Intensity") +
-  xlab("Regional Aggregate") +
-  theme_minimal()+
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
-
-png(paste0(dir, "/results/figures/fig8.png"), 
-    width = 2400, height = 1600, res = 300)
-
-interval_summary |>
-  filter(Tech != 'Ceramic LSA') |>
-  
-  ggplot(aes(x = cluster_cat, y = estimate)) +
-  geom_point(size = 3) +
-  geom_errorbar(
-    aes(ymin = lower, ymax = upper),
-    width = 0.15
-  ) +
-  facet_wrap(~Tech, scales = 'free') +
-  ylab("Radiocarbon Intensity") +
-  xlab("Regional Aggregate") +
-  theme_minimal()+
-  theme(
-    axis.text.x = element_text(angle = 45, hjust = 1)
-  )
-
-dev.off()
+loo_compare(loo1, loo2, loo3, loo4)
+# first model fits best
 ```
 
 ```{r}
-draws <- as_draws_df(fit_space_h4)
-
-
-cluster_slopes <- draws |>
-  select(
-    .draw,
-    starts_with("r_cluster_cat[")
-  ) |>
-  pivot_longer(
-    cols = starts_with("r_cluster_cat["),
-    names_to = "cluster",
-    values_to = "cluster_deviation"
-  ) |>
+loo_df <- fit_df %>%
   mutate(
-    cluster = 
-      str_extract(cluster, "(?<=\\[)[^,]+"),
-  ) |>
-  select(.draw, cluster, cluster_deviation)
-
-tech_slopes <- draws |>
-  select(
-    .draw,
-    matches("^r_Tech\\[.*,time_ka\\]$")
-  ) |>
-  pivot_longer(
-    cols = -.draw,
-    names_to = "Tech",
-    values_to = "tech_deviation"
-  ) |>
-  mutate(
-    Tech = 
-      str_extract(Tech, "(?<=\\[)[^,]+")
-  ) |>
-  select(.draw, Tech, tech_deviation)
-
-
-fixed_slope <- draws |>
-  select(.draw, b_time_ka)
-
-slope_draws <- cluster_slopes |>
-  left_join(
-    tech_slopes,
-    by = ".draw",
-    relationship = "many-to-many"
-  ) |>
-  left_join(
-    fixed_slope,
-    by = ".draw"
-  ) |>
-  mutate(
-    cluster_tech = paste(cluster, Tech, sep = "_"),
-    cluster_slope =
-      b_time_ka +
-      cluster_deviation +
-      tech_deviation
+    pareto_k = loo1$diagnostics$pareto_k
   )
 
 
-slope_pairs <- combn(
-  unique(slope_draws$cluster_tech),
-  2,
-  simplify = FALSE
+loo_df %>%
+  summarise(
+    n = n(),
+    mean_k = mean(pareto_k),
+    median_k = median(pareto_k),
+    max_k = max(pareto_k),
+    n_problem = sum(pareto_k > 0.7)
+  )
+
+loo_df %>%
+  group_by(RFZ) %>%
+  summarise(
+    n = n(),
+    mean_k = mean(pareto_k),
+    median_k = median(pareto_k),
+    max_k = max(pareto_k),
+    n_problem = sum(pareto_k > 0.7)
+  )
+
+site_sensitivity <- loo_df %>%
+  group_by(Site) %>%
+  summarise(
+    n = n(),
+    mean_k = mean(pareto_k),
+    max_k = max(pareto_k),
+    n_k07 = sum(pareto_k > 0.7),
+    n_k1 = sum(pareto_k > 1)
+  ) %>%
+  arrange(desc(max_k))
+
+
+period_sensitivity <- loo_df %>%
+  group_by(Period) %>%
+  summarise(
+    n = n(),
+    mean_k = mean(pareto_k),
+    median_k = median(pareto_k),
+    max_k = max(pareto_k),
+    n_k07 = sum(pareto_k > 0.7)
+  )
+
+geoloc_sensitivity <- loo_df %>%
+  group_by(RFZ) %>%
+  summarise(
+    n = n(),
+    mean_k = mean(pareto_k),
+    median_k = median(pareto_k),
+    max_k = max(pareto_k),
+    n_k07 = sum(pareto_k > 0.7)
+  )
+
+
+ggplot(
+  site_sensitivity,
+  aes(
+    x = reorder(Site, max_k),
+    y = max_k
+  )
+) +
+  geom_point() +
+  geom_hline(
+    yintercept = 0.7,
+    linetype = "dashed"
+  ) +
+  coord_flip() +
+  labs(
+    x = "Site",
+    y = "Maximum Pareto k"
+  )
+
+ggplot(
+  period_sensitivity,
+  aes(
+    x = reorder(Period, max_k),
+    y = max_k
+  )
+) +
+  geom_point() +
+  geom_hline(
+    yintercept = 0.7,
+    linetype = "dashed"
+  ) +
+  coord_flip() +
+  labs(
+    x = "Site",
+    y = "Maximum Pareto k"
+  )
+
+
+ggplot(
+  geoloc_sensitivity,
+  aes(
+    x = reorder(RFZ, max_k),
+    y = max_k
+  )
+) +
+  geom_point() +
+  geom_hline(
+    yintercept = 0.7,
+    linetype = "dashed"
+  ) +
+  coord_flip() +
+  labs(
+    x = "Site",
+    y = "Maximum Pareto k"
+  )
+```
+
+# Change Point at 6ka?
+
+```{r}
+fit_df <- za_df %>%
+  group_by(calBP, Zone_Name) %>%
+  summarize(
+    site_count = sum(count, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    median_calBP = calBP,
+    time_ka = -(calBP - mean(calBP, na.rm = TRUE)) / 1000
+  )
+
+fit_df_taph <- za_df_taph %>%
+  group_by(calBP, Zone_Name) %>%
+  summarize(
+    site_count = sum(count, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    median_calBP = calBP,
+    time_ka = -(calBP - mean(calBP, na.rm = TRUE)) / 1000
+  )
+
+
+# Global change point
+hinge_fun <- stanvar(
+  scode = "
+  real hinge(real x, real cp) {
+    return fmax(0, x - cp);
+  }
+  ",
+  block = "functions"
 )
 
 
-slope_pair_comp <- tibble(
-  combination_1 = character(),
-  combination_2 = character(),
-  estimate = numeric(),
-  lower = numeric(),
-  upper = numeric(),
-  prob_1_greater = numeric(),
-  rate_ratio = numeric(),
-  rate_ratio_lower = numeric(),
-  rate_ratio_upper = numeric()
-)
-for(i in slope_pairs){
+# Three change points per region
+model_fit_rfz_3cp <- bf(
+  site_count ~ alpha +
+    beta1 * time_ka +
+    beta2 * hinge(time_ka, cp1) +
+    beta3 * hinge(time_ka, 6) +
+    beta4 * hinge(time_ka, cp3),
   
+  alpha ~ 1,
+  beta1 ~ 1 + Zone_Name,
+  beta2 ~ 1 + Zone_Name,
+  beta3 ~ 1 + Zone_Name,
+  beta4 ~ 1 + Zone_Name,
+  
+  cp1 ~ 0 + Zone_Name,
+  cp3 ~ 0 + Zone_Name,
+  
+  nl = TRUE
+)
 
+
+prior_fit_rfz_3cp <- c(
+  
+  # baseline
+  prior(
+    normal(0, 1),
+    class = "b",
+    nlpar = "alpha"
+  ),
+  
+  # initial slope
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta1"
+  ),
+  
+  # slope change at CP1
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta2"
+  ),
+  
+  # additional slope change at CP2
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta3"
+  ),
+  
+  # additional slope change at CP3
+  prior(
+    normal(0, 0.1),
+    class = "b",
+    nlpar = "beta4"
+  ),
+  
+  # CP1
+  # third change point from Robberg to Oakhurst
+  prior(
+    normal(12, 0.5),
+    class = "b",
+    nlpar = "cp1"
+  ),
+  
+  # CP3
+  # last change point from Wilton to final LSA
+  prior(
+    normal(2.12, 2),
+    class = "b",
+    nlpar = "cp3"
+  )
+)
+
+seed <- seed + 1
+
+fit_time_rfz_3cp_6ka <- brm(
+  model_fit_rfz_3cp,
+  data = fit_df,
+  family = zero_inflated_poisson(),
+  prior = prior_fit_rfz_3cp,
+  
+  stanvars = hinge_fun,
+  
+  chains = 2,
+  iter = 1000,
+  warmup = 500,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed,
+  
+  sample_prior = 'yes'
+)
+
+
+seed <- seed + 1
+
+fit_time_rfz_3cp_taph_6ka <- brm(
+  model_fit_rfz_3cp,
+  data = fit_df_taph,
+  family = zero_inflated_poisson(),
+  prior = prior_fit_rfz_3cp,
+  
+  stanvars = hinge_fun,
+  
+  chains = 2,
+  iter = 1000,
+  warmup = 500,
+  
+  cores = 4,
+  threads = threading(8),
+  backend = 'cmdstanr',
+  seed = seed,
+  
+  sample_prior = 'yes'
+)
+```
+
+```{r}
+# compare fit between strict and loose change point at 6 ka
+expose_functions(fit_time_rfz_3cp_6ka, vectorize = TRUE)
+
+loo_compare(loo(fit_time_rfz_3cp_6ka),
+            loo(fit_time_rfz_3cp))
+# the 3cp fits a lot better than 6ka model
+```
+
+```{r}
+draws_rfz_cp3 <- as_draws_df(fit_time_rfz_3cp) %>%
+  mutate(
     
-    wide <- slope_draws |>
-      filter(
-        cluster_tech %in% i
-      ) |>
-      select(.draw, cluster_tech, cluster_slope) |>
-      mutate(
-        cluster_tech = as.character(cluster_tech)
-      ) |>
-      pivot_wider(
-        id_cols = .draw,
-        names_from = cluster_tech,
-        values_from = cluster_slope
-      )
+    # Summer change points
+    slope_before_cp1_summer =
+      b_beta1_Intercept,
     
-    diff <- wide[,2] - wide[,3]
+    slope_after_cp1_summer =
+      b_beta1_Intercept + b_beta2_Intercept,
     
-    tmp_tib <- tibble(
-      combination_1 = i[1],
-      combination_2 = i[2],
-      estimate = median(diff[[1]]),
-      lower = quantile(diff[[1]], 0.05),
-      upper = quantile(diff[[1]], 0.95),
-      prob_1_greater = mean(diff[[1]] > 0),
-      rate_ratio = median(exp(diff[[1]])),
-      rate_ratio_lower = quantile(exp(diff[[1]]), 0.05),
-      rate_ratio_upper = quantile(exp(diff[[1]]), 0.95)
-    )
+    slope_after_cp2_summer =
+      b_beta1_Intercept + b_beta2_Intercept + b_beta3_Intercept,
     
-    slope_pair_comp <- slope_pair_comp |>
-      add_row(tmp_tib)
+    slope_after_cp3_summer =
+      b_beta1_Intercept + b_beta2_Intercept + 
+      b_beta3_Intercept + b_beta4_Intercept,
+    
+    CP1_summer = b_cp1_Zone_NameS,
+    CP2_summer = b_cp2_Zone_NameS,
+    CP3_summer = b_cp3_Zone_NameS,
+    
+    
+    # Winter change points
+    slope_before_cp1_winter =
+      b_beta1_Zone_NameW,
+    
+    slope_after_cp1_winter =
+      b_beta1_Zone_NameW + b_beta2_Zone_NameW ,
+    
+    slope_after_cp2_winter =
+      b_beta1_Zone_NameW + b_beta2_Zone_NameW  + b_beta3_Zone_NameW,
+    
+    slope_after_cp3_winter =
+      b_beta1_Zone_NameW + b_beta2_Zone_NameW  + 
+      b_beta3_Zone_NameW + b_beta4_Zone_NameW,
+    
+    CP1_winter = b_cp1_Zone_NameW,
+    CP2_winter = b_cp2_Zone_NameW,
+    CP3_winter = b_cp3_Zone_NameW,
+    
+    
+    # Yearround change points
+    slope_before_cp1_yearround =
+      b_beta1_Zone_NameY,
+    
+    slope_after_cp1_yearround =
+      b_beta1_Zone_NameY + b_beta2_Zone_NameY ,
+    
+    slope_after_cp2_yearround =
+      b_beta1_Zone_NameY + b_beta2_Zone_NameY  + b_beta3_Zone_NameY,
+    
+    slope_after_cp3_yearround =
+      b_beta1_Zone_NameY + b_beta2_Zone_NameY  + 
+      b_beta3_Zone_NameY + b_beta4_Zone_NameY,
+    
+    CP1_yearround = b_cp1_Zone_NameY,
+    CP2_yearround = b_cp2_Zone_NameY,
+    CP3_yearround = b_cp3_Zone_NameY,
+    
+  )
+
+draws_rfz_cp3 |>
+  select(slope_before_cp1_summer:slope_after_cp3_summer,
+         slope_before_cp1_winter:slope_after_cp3_winter,
+         slope_before_cp1_yearround:slope_after_cp3_yearround) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Slope",
+    values_to = "RFZ"
+  ) %>%
+  group_by(Slope) %>%
+  summarise(
+    estimate = median(RFZ),
+    lower = quantile(RFZ, 0.025),
+    upper = quantile(RFZ, 0.975)
+  ) %>%
+  mutate('Period' = str_split_i(Slope, '_', 2),
+         'Change Point' = str_split_i(Slope, '_', 3),
+         'RFZ' = str_split_i(Slope, '_', 4)) %>%
+  mutate(`Change Point` = ifelse(Period == 'before', 'cp0', `Change Point`)) %>%
+  arrange(`Change Point`) %>%
+  
+  ggplot(aes(x = estimate, y = `Change Point`, color = RFZ))+
+  geom_errorbarh(aes(xmin = lower, xmax = upper),
+                 position = position_dodge(width = 0.9),
+                 width = 0.8)+
+  geom_point(
+    position = position_dodge(width = 0.9)
+  )
+
+
+
+draws_rfz_cp3 |>
+  select(CP1_summer:CP3_summer,
+         CP1_winter:CP3_winter,
+         CP1_yearround:CP3_yearround) |>
+  pivot_longer(
+    everything(),
+    names_to = "ChangePoint",
+    values_to = "cp"
+  ) |>
+  group_by(ChangePoint) |>
+  summarise(
+    estimate = median(cp),
+    lower = quantile(cp, 0.025),
+    upper = quantile(cp, 0.975),
+    
+    calBP_estimate = (-estimate * 1000) + mean(fit_df$calBP),
+    calBP_lwr = (-lower * 1000) + mean(fit_df$calBP),
+    calBP_upr = (-upper * 1000) + mean(fit_df$calBP)
+  ) %>%
+  mutate('Change Point' = str_split_i(ChangePoint, '_', 1),
+         'RFZ' = str_split_i(ChangePoint, '_', 2)) %>%
+  arrange(`Change Point`) %>%
+  
+  ggplot(aes(x = calBP_estimate, y = `Change Point`, color = RFZ))+
+  geom_errorbarh(aes(xmin = calBP_lwr, xmax = calBP_upr),
+                 position = position_dodge(width = 0.9),
+                 width = 0.8)+
+  geom_point(
+    position = position_dodge(width = 0.9)
+  )
+```
+
+# Leave One Out Cross Validation
+
+```{r}
+site_sensitivity %>%
+  filter(max_k > 0.2) %>%
+  distinct(Site) -> sites
+```
+
+```{r}
+my_prior <-
+  prior(normal(0, 1), class = 'Intercept')+
+  
+  prior(normal(0, 2), class = 'b', coef = 'time_ka')+
+  prior(normal(0, 2), class = 'b', coef = 'RFZS')+
+  prior(normal(0, 2), class = 'b', coef = 'RFZW')+
+  
+  prior(normal(0, 2), class = 'b', coef = 'time_ka:RFZS')+
+  prior(normal(0, 2), class = 'b', coef = 'time_ka:RFZW')+
+  
+  prior(exponential(1), class = 'sd', coef = 'Intercept', group = 'RFZ')+
+  
+  prior(inv_gamma(0.4, 0.3), class = 'shape')
+
+
+seed <- 1777
+
+jackknife_results <- vector("list", length(sites))
+#j_TMP <- jackknife_results
+
+for(i in 1:length(sites$Site)) {
+  
+  site_i <- sites$Site[i]
+  
+  message(
+    "Fitting ", i, "/", length(sites$Site),
+    ": leaving out ", site_i
+  )
+  
+  dat_i <- fit_df %>%
+    filter(Site != site_i)
+  
+  fit_i <- brm(
+    site_count ~ 1 + time_ka * RFZ + (1 | RFZ),
+    
+    family = negbinomial(),
+    
+    data = dat_i,
+    
+    prior = my_prior,
+    
+    chains = 1,
+    iter = 4000,
+    warmup = 2000,
+    
+    control = list(adapt_delta = 0.9),
+    
+    cores = 4,
+    threads = threading(8),
+    
+    backend = "cmdstanr",
+    seed = seed + i
+  )
+  
+  jackknife_results[[i]] <- list(
+    site_removed = site_i,
+    fit = fit_i
+  )
 }
 ```
 
 ```{r}
-# Track interior karoo rates across technologicl classifications
-slope_pair_comp |>
-  filter(str_detect(combination_1, 'Karoo') & 
-           str_detect(combination_2, 'Karoo')) |>
-  select(combination_1:combination_2, rate_ratio:rate_ratio_upper)
 
-
-# Track southern coast rates across technologicl classifications
-slope_pair_comp |>
-  filter(str_detect(combination_1, 'Southern') & 
-           str_detect(combination_2, 'Southern')) |>
-  select(combination_1:combination_2, rate_ratio:rate_ratio_upper)
-
-# Track southern coast rates across technologicl classifications
-slope_pair_comp |>
-  filter(str_detect(combination_1, 'East') & 
-           str_detect(combination_2, 'East')) |>
-  select(combination_1:combination_2, rate_ratio:rate_ratio_upper)
-```
-
-# Change Points
-
-```{r}
-time_mean <- mean(fit_df$calBP, na.rm = TRUE)
-
-interval_grid <- crossing(
-  intervals,
-  cluster_cat = unique(fit_df$cluster_cat),
-  Tech = unique(fit_df$Tech),
-  calBP = seq(1000, 21000, by = 500)
-) |>
-  filter(
-    calBP >= pmin(start, end),
-    calBP <= pmax(start, end)
-  ) |>
-  mutate(
-    time_ka = -(calBP - time_mean)/1000
+pred_grid <- fit_df |>
+  distinct(RFZ) |>
+  crossing(
+    time_ka = seq(
+      min(fit_df$time_ka, na.rm = TRUE),
+      max(fit_df$time_ka, na.rm = TRUE),
+      length.out = 100
+    )
   )
 
-interval_pred <- posterior_epred(
-  fit_space_h4,
-  newdata = interval_grid,
-  re_formula = NULL
+for(i in jackknife_results){
+
+
+pred <- posterior_epred(
+  i$fit,
+  newdata = pred_grid,
+  re_formula = NULL,
+  allow_new_levels = TRUE
 )
 
 
-pred_long <- interval_grid |>
-  select(cluster_cat, Tech, calBP) |>
-  bind_cols(
-    as.data.frame(t(interval_pred))
-  ) |>
+pred_summary <- pred %>%
+  t() %>%
+  as.data.frame() %>%
+  setNames(paste0("draw_", seq_len(ncol(.)))) %>%
+  bind_cols(pred_grid) |>
   pivot_longer(
-    cols = starts_with("V"),
+    cols = starts_with("draw_"),
     names_to = "draw",
     values_to = "mu"
   ) |>
-  group_by(cluster_cat, Tech, calBP) |>
-  summarize(Estimate = mean(mu),
-            Q2.5 = quantile(mu, 0.025),
-            Q97.5 = quantile(mu, 0.975))
+  group_by(time_ka, RFZ) |>
+  summarise(
+    estimate = median(mu),
+    lower = quantile(mu, 0.025),
+    upper = quantile(mu, 0.975),
+    .groups = "drop"
+  )
 
 
-# plot robberg distribution
 ggplot(
-  pred_long |> 
-    filter(calBP > 7000,
-           Tech == 'Robberg'),
+  pred_summary |>
+    filter(!is.na(RFZ)) |>
+    mutate(calBP = (-time_ka * 1000) + mean(fit_df$calBP)),
   aes(
     x = calBP,
-    y = Estimate,
-    group = cluster_cat,
-    colour = cluster_cat
+    y = estimate,
+    group = RFZ,
+    linetype = RFZ
   )
 ) +
   geom_ribbon(
     aes(
-      ymin = Q2.5,
-      ymax = Q97.5,
-      fill = cluster_cat
+      ymin = lower,
+      ymax = upper
     ),
     alpha = 0.15,
-    colour = NA
+    color = NA
   ) +
   geom_line(linewidth = 1) +
-  facet_wrap(~Tech, scales = 'free') +
+  scale_x_reverse() +
   labs(
-    x = "Calendar age (cal BP)",
-    y = "Radiocarbon Intensity",
-    colour = "Cluster",
-    fill = "Cluster"
+    x = "Time (ka cal BP)",
+    y = "Estimated Radiocarbon Intensity",
+    linetype = "Period",
+    title = paste0(i$site_removed)
   ) +
-  scale_x_reverse()+
-  theme_classic() -> gg_robberg
+  theme_classic() -> gg_tmp
 
-# plot oakhurst distribution
-ggplot(
-  pred_long |> 
-    filter(calBP > 5000,
-           Tech == 'Oakhurst'),
-  aes(
-    x = calBP,
-    y = Estimate,
-    group = cluster_cat,
-    colour = cluster_cat
-  )
-) +
-  geom_ribbon(
-    aes(
-      ymin = Q2.5,
-      ymax = Q97.5,
-      fill = cluster_cat
-    ),
-    alpha = 0.15,
-    colour = NA
-  ) +
-  geom_line(linewidth = 1) +
-  facet_wrap(~Tech, scales = 'free') +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Radiocarbon Intensity",
-    colour = "Cluster",
-    fill = "Cluster"
-  ) +
-  scale_x_reverse()+
-  theme_classic() -> gg_oakhurst
-
-# plot wilton distribution
-ggplot(
-  pred_long |> 
-    filter((calBP > 4000) & (calBP < 12000),
-           Tech == 'Wilton'),
-  aes(
-    x = calBP,
-    y = Estimate,
-    group = cluster_cat,
-    colour = cluster_cat
-  )
-) +
-  geom_ribbon(
-    aes(
-      ymin = Q2.5,
-      ymax = Q97.5,
-      fill = cluster_cat
-    ),
-    alpha = 0.15,
-    colour = NA
-  ) +
-  geom_line(linewidth = 1) +
-  facet_wrap(~Tech, scales = 'free') +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Radiocarbon Intensity",
-    colour = "Cluster",
-    fill = "Cluster"
-  ) +
-  scale_x_reverse()+
-  theme_classic() -> gg_wilton
-
-# plot final LSA distribution
-ggplot(
-  pred_long |> 
-    filter(calBP < 7000,
-           Tech == 'Final LSA'),
-  aes(
-    x = calBP,
-    y = Estimate,
-    group = cluster_cat,
-    colour = cluster_cat
-  )
-) +
-  geom_ribbon(
-    aes(
-      ymin = Q2.5,
-      ymax = Q97.5,
-      fill = cluster_cat
-    ),
-    alpha = 0.15,
-    colour = NA
-  ) +
-  geom_line(linewidth = 1) +
-  facet_wrap(~Tech, scales = 'free') +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Radiocarbon Intensity",
-    colour = "Cluster",
-    fill = "Cluster"
-  ) +
-  scale_x_reverse()+
-  theme_classic() -> gg_finalLSA 
+  print(gg_tmp)
+}
 ```
 
 ```{r}
-png(paste0(dir, "/results/figures/fig9.png"), 
-    width = 2400, height = 1600, res = 300)
-
-ggarrange(
-  gg_robberg, gg_oakhurst,
-  gg_wilton, gg_finalLSA,
-  
-  common.legend = TRUE
-)
-
-dev.off()
-```
-
-```{r}
-time_mean <- mean(fit_df$calBP, na.rm = TRUE)
-
-interval_grid <- crossing(
-  intervals,
-  cluster_cat = unique(fit_df$cluster_cat),
-  calBP = seq(1000, 21000, by = 500)
-) |>
-  filter(
-    calBP >= pmin(start, end),
-    calBP <= pmax(start, end)
-  ) |>
-  mutate(
-    time_ka = -(calBP - time_mean)/1000
-  )
-
-interval_pred <- posterior_epred(
-  fit_space_h3,
-  newdata = interval_grid,
-  re_formula = NULL
-)
-
-
-pred_long <- interval_grid |>
-  select(period, cluster_cat, calBP) |>
-  bind_cols(
-    as.data.frame(t(interval_pred))
-  ) |>
-  pivot_longer(
-    cols = starts_with("V"),
-    names_to = "draw",
-    values_to = "mu"
-  ) |>
-  group_by(cluster_cat, period, calBP) |>
-  summarize(Estimate = mean(mu),
-            Q2.5 = quantile(mu, 0.025),
-            Q97.5 = quantile(mu, 0.975))
-
-
-# plot robberg distribution
-ggplot(
-  pred_long |> 
-    filter(period == 'Robberg'),
-  aes(
-    x = calBP,
-    y = Estimate,
-    group = cluster_cat,
-    colour = cluster_cat
-  )
-) +
-  geom_ribbon(
-    aes(
-      ymin = Q2.5,
-      ymax = Q97.5,
-      fill = cluster_cat
-    ),
-    alpha = 0.15,
-    colour = NA
-  ) +
-  geom_line(linewidth = 1) +
-  facet_wrap(~period, scales = 'free') +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Radiocarbon Intensity",
-    colour = "Cluster",
-    fill = "Cluster"
-  ) +
-  scale_x_reverse()+
-  theme_classic() -> gg_robberg
-
-# plot oakhurst distribution
-ggplot(
-  pred_long |> 
-    filter(period == 'Oakhurst'),
-  aes(
-    x = calBP,
-    y = Estimate,
-    group = cluster_cat,
-    colour = cluster_cat
-  )
-) +
-  geom_ribbon(
-    aes(
-      ymin = Q2.5,
-      ymax = Q97.5,
-      fill = cluster_cat
-    ),
-    alpha = 0.15,
-    colour = NA
-  ) +
-  geom_line(linewidth = 1) +
-  facet_wrap(~period, scales = 'free') +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Radiocarbon Intensity",
-    colour = "Cluster",
-    fill = "Cluster"
-  ) +
-  scale_x_reverse()+
-  theme_classic() -> gg_oakhurst
-
-# plot wilton distribution
-ggplot(
-  pred_long |> 
-    filter(period == 'Wilton'),
-  aes(
-    x = calBP,
-    y = Estimate,
-    group = cluster_cat,
-    colour = cluster_cat
-  )
-) +
-  geom_ribbon(
-    aes(
-      ymin = Q2.5,
-      ymax = Q97.5,
-      fill = cluster_cat
-    ),
-    alpha = 0.15,
-    colour = NA
-  ) +
-  geom_line(linewidth = 1) +
-  facet_wrap(~period, scales = 'free') +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Radiocarbon Intensity",
-    colour = "Cluster",
-    fill = "Cluster"
-  ) +
-  scale_x_reverse()+
-  theme_classic() -> gg_wilton
-
-# plot final LSA distribution
-ggplot(
-  pred_long |> 
-    filter(period == 'Final LSA'),
-  aes(
-    x = calBP,
-    y = Estimate,
-    group = cluster_cat,
-    colour = cluster_cat
-  )
-) +
-  geom_ribbon(
-    aes(
-      ymin = Q2.5,
-      ymax = Q97.5,
-      fill = cluster_cat
-    ),
-    alpha = 0.15,
-    colour = NA
-  ) +
-  geom_line(linewidth = 1) +
-  facet_wrap(~period, scales = 'free') +
-  labs(
-    x = "Calendar age (cal BP)",
-    y = "Radiocarbon Intensity",
-    colour = "Cluster",
-    fill = "Cluster"
-  ) +
-  scale_x_reverse()+
-  theme_classic() -> gg_finalLSA 
-```
-
-```{r}
-png(paste0(dir, "/results/figures/fig7.png"), 
-    width = 2400, height = 1600, res = 300)
-
-ggarrange(
-  gg_robberg, gg_oakhurst,
-  gg_wilton, gg_finalLSA,
-  
-  common.legend = TRUE
-)
-
-dev.off()
+expose_functions(fit_1cp_rw, vectorize = TRUE)
+loo_compare(loo(fit_linear_rw), loo(fit_1cp_rw), 
+            loo(fit_geocp_rw), loo(fit_geocp3_rw), loo(fit_hiercp_rw), 
+            loo(fit_hiercp3_rw))
 ```
