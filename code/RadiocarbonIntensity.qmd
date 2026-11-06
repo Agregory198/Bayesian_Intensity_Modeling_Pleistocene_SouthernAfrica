@@ -287,7 +287,6 @@ pp_check(fit_space_taph)
 #### Uncorrected count data
 
 ```{r}
-
 pred_grid <- tibble(
     time_ka = seq(
       min(fit_df$time_ka, na.rm = TRUE),
@@ -749,10 +748,9 @@ fit_time_0cp_taph_gg <-
 slope_0cp <- rbind(
   slope_at_boundaries %>% mutate(date = 'Original'),
   slope_at_boundaries_taph %>% mutate(date = 'Adjusted')
-  )
-```
+)
 
-```{r}
+
 png(paste0(dir, "/results/figures/Fig3.png"), 
     width = 1600, height = 800, res = 300)
 
@@ -1876,20 +1874,23 @@ nd <- data.frame(time_ka = seq(min(fit_df$time_ka),
                                0.1))
 
 # draws x zones matrix for each nonlinear parameter
-get_par <- function(par) posterior_linpred(fit_time_4cp, newdata = nd, nlpar = par)
+get_par <- function(par) posterior_linpred(fit_time_5cp, newdata = nd, nlpar = par)
 
-p <- lapply(c("beta1","beta2","beta3","beta4", "beta5", "cp1","cp2","cp3", "cp4"),
+p <- lapply(c("beta1","beta2","beta3","beta4", "beta5", "beta6",
+              "cp1","cp2","cp3", "cp4", "cp5"),
             get_par)
-names(p) <- c("beta1","beta2","beta3","beta4", "beta5", "cp1","cp2","cp3", "cp4")
+names(p) <- c("beta1","beta2","beta3","beta4", "beta5", "beta6",
+              "cp1","cp2","cp3", "cp4", "cp5")
 
 # Slopes (log-rate per ka), oldest -> youngest segments
 # Segment ordering assumes cp1 > cp2 > cp3 (older -> younger)
 slopes <- list(
-  seg_young_of_cp4   = p$beta1,                              # t < cp3
-  seg_cp4_to_cp3     = p$beta1 + p$beta5,                    # cp3 < t < cp2
-  seg_cp3_to_cp2     = p$beta1 + p$beta5 + p$beta4,          # cp2 < t < cp1
-  seg_cp2_to_cp1     = p$beta1 + p$beta5 + p$beta4 + p$beta3,
-  seg_older_than_cp1 = p$beta1 + p$beta5 + p$beta4 + p$beta3 + p$beta2 # t > cp1
+  seg_young_of_cp5   = p$beta1,                              # t < cp3
+  seg_cp5_to_cp4     = p$beta1 + p$beta6,                    # cp3 < t < cp2
+  seg_cp4_to_cp3     = p$beta1 + p$beta6 + p$beta5,          # cp2 < t < cp1
+  seg_cp3_to_cp2     = p$beta1 + p$beta6 + p$beta5 + p$beta4,
+  seg_cp2_to_cp1 = p$beta1 + p$beta6 + p$beta5 + p$beta4 + p$beta3,
+  seg_older_than_cp1 = p$beta1 + p$beta6 + p$beta5 + p$beta4 + p$beta3 + p$beta2
 )
 
 summ <- function(m, name) {
@@ -1906,7 +1907,8 @@ cp_summary <- bind_rows(
   summ(p$cp1, "CP1 (Robberg/Oakhurst)"),
   summ(p$cp2, "CP2 (Oakhurst/Wilton)"),
   summ(p$cp3, "CP3 (Wilton/final LSA)"),
-  summ(p$cp4, "CP4 (Wilton/final LSA)2")
+  summ(p$cp4, "CP4 (Wilton/final LSA)2"),
+  summ(p$cp5, "CP5 (Wilton/final LSA)3")
 ) %>%
   distinct(quantity, mean, .keep_all = TRUE) %>%
   mutate(
@@ -1923,6 +1925,7 @@ slope_summary <- bind_rows(lapply(names(slopes),
 
 # Slope change at each CP (just the hinge coefficient), with P(change > 0)
 change_summary <- bind_rows(
+  summ(p$beta6, "slope change at CP5"),
   summ(p$beta5, "slope change at CP4"),
   summ(p$beta4, "slope change at CP3"),
   summ(p$beta3, "slope change at CP2"),
@@ -1937,12 +1940,12 @@ pred_grid <- tibble(
   time_ka = seq(
     min(fit_df$time_ka, na.rm = TRUE),
     max(fit_df$time_ka, na.rm = TRUE),
-    length.out = 100
+    length.out = 1000
   )
 )
 
 pred <- posterior_epred(
-  fit_time_4cp,
+  fit_time_5cp,
   newdata = pred_grid,
   re_formula = NULL,
   allow_new_levels = TRUE
@@ -1967,15 +1970,131 @@ pred_summary <- pred %>%
     .groups = "drop"
   ) |>
   mutate(calBP = (-time_ka * 1000) + mean(fit_df$calBP)) %>%
-  
   filter(calBP < 27000, calBP > 500)
 
 
-png(paste0(dir, "/results/figures/Fig6A.png"), 
-    width = 2200, height = 800, res = 300)
+###############################
+# compute the slope summary
+pred_grid_full <- tibble(
+  time_ka = seq(
+    min(fit_df$time_ka, na.rm = TRUE),
+    max(fit_df$time_ka, na.rm = TRUE),
+    length.out = nrow(fit_df)
+  )
+)
 
-ggplot() +
+pred_full <- posterior_epred(
+  fit_time_5cp,
+  newdata = pred_grid_full,
+  re_formula = NULL,
+  allow_new_levels = TRUE
+)
+
+
+
+# Difference between adjacent time points
+dt <- diff(pred_grid_full$time_ka)
+
+# Posterior slope for each draw
+slopes <- (pred_full[, -1] - pred_full[, -ncol(pred_full)]) /
+  rep(dt, each = nrow(pred_full))
+
+# Summarize posterior slopes
+slope_summary <- data.frame(
+  time_ka = pred_grid_full$time_ka[-1] -
+    dt / 2,
+  slope_mean = colMeans(slopes),
+  slope_lower = apply(slopes, 2, quantile, 0.025),
+  slope_upper = apply(slopes, 2, quantile, 0.975)
+) %>%
+  mutate(calBP = (-time_ka * 1000) + mean(fit_df$calBP))
+
+slope_at_origin <- boundaries %>%
+  filter(RFZ == 'ZA') %>%
+  rowwise() %>%
+  mutate(
+    slope_summary %>%
+      slice_min(
+        abs(calBP - Origin),
+        n = 1
+      ) %>%
+      select(slope_mean, slope_lower, slope_upper)
+  ) %>%
+  ungroup()
+
+
+slope_at_termination <- boundaries %>%
+  filter(RFZ == 'ZA') %>%
+  rowwise() %>%
+  mutate(
+    slope_summary %>%
+      slice_min(
+        abs(calBP - Termination),
+        n = 1
+      ) %>%
+      select(slope_mean, slope_lower, slope_upper)
+  ) %>%
+  ungroup()
+
+
+slope_at_boundaries <- rbind(slope_at_origin,
+                             slope_at_termination)
+```
+
+```{r}
+fit_time_5cp_gg <- 
+  ggplot() +
   
+  # Where the slope is no different than 0
+  geom_segment(
+    data = slope_summary %>%
+      mutate(calBP = round(calBP)) %>%
+      filter((slope_upper < 0 & slope_lower > 0) | 
+               (slope_upper > 0 & slope_lower < 0)) %>%
+      inner_join(
+        pred_summary %>%
+          mutate(calBP = round(calBP)),
+        by = "calBP"
+      ), 
+    aes(
+      x = calBP,
+      xend = calBP,
+      y = lower,
+      yend = upper
+    ),
+    color = "red"
+  ) +
+  
+  # Reset color scale
+  new_scale_color() +
+  
+  geom_rect(data = cp_summary,
+            aes(xmin = calBP_upr, xmax = calBP_lwr, 
+                ymin = 0, ymax = 0.4),
+            alpha = 0.3) +
+  
+  # Observed site counts
+  geom_segment(
+    data = fit_df %>% filter(calBP > 500, calBP < 27000, site_count > 0),
+    aes(
+      x = calBP,
+      xend = calBP,
+      y = -0.02,
+      yend = 0,
+      color = site_count
+    ),
+    linewidth = 0.5,
+    alpha = 0.7
+  ) +
+  
+  scale_color_gradient(
+    low = "grey85",
+    high = "orangered",
+    name = "Site count"
+  ) +
+  
+  # Reset color scale
+  new_scale_color() +
   
   # Bayesian credible interval
   geom_ribbon(
@@ -1997,59 +2116,58 @@ ggplot() +
       x = calBP,
       y = estimate
     ),
-    linewidth = 1,
+    linewidth = 0.3,
     color = 'black'
   ) +
   
-  geom_rect(data = cp_summary,
-            aes(xmin = calBP_upr, xmax = calBP_lwr, 
-                ymin = 0, ymax = 0.4),
-            alpha = 0.3) +
-  
   # Robberg 
-  geom_errorbar(aes(xmin = 9764, 
-                    xmax = 24727,
-                    y = 0.6), 
+  geom_errorbar(data = boundaries %>% filter(RFZ == 'ZA'),
+                aes(xmin = Termination, 
+                    xmax = Origin,
+                    y = 0.6, color = factor(Industry)), 
+                position = 'dodge',
                 width = 0.05, 
-                color = "orange", 
-                linewidth = 1) +
+                linewidth = 0.5) +
   
-  # Okakhurst
-  geom_errorbar(aes(xmin = 5519, 
-                    xmax = 14848,
-                    y = 0.55), 
-                width = 0.05, 
-                color = "darkblue", 
-                linewidth = 1) +
+  scale_color_manual(
+    values = c(
+      "Robberg" = "orange",
+      "Oakhurst" = "blue",
+      "Wilton" = "darkgreen",
+      'Final LSA' = "magenta"
+    ),
+    name = "Technological\nPeriod"
+  ) +
   
-  # Wilton
-  geom_errorbar(aes(xmin = 697, 
-                    xmax = 10725,
-                    y = 0.5), 
-                width = 0.05, 
-                color = "forestgreen", 
-                linewidth = 1) +
-  
-  # Final LSA
-  geom_errorbar(aes(xmin = 58, 
-                    xmax = 5892,
-                    y = 0.45), 
-                width = 0.05, 
-                color = "black", 
-                linewidth = 1) +
+  # Reset color scale
+  new_scale_color() +
   
   # Reverse BP axis
   scale_x_reverse() +
   
   labs(
     x = "Calibrated Years BP",
-    y = 'Radiocarbon Count',
+    y = 'Expected Radiocarbon Count',
     fill = "Site Count"
   ) +
+  ylim(-0.02, 0.8) +
   
-  theme_minimal(base_size = 8)
-
-dev.off()
+  theme_minimal() +
+  
+  theme(
+    # Reduce the font size of the legend title
+    legend.title = element_text(size = 5), 
+    
+    # Reduce the font size of the legend labels
+    legend.text = element_text(size = 4),
+    
+    # Shrink the size of the keys (the symbols/boxes)
+    legend.key.size = unit(0.3, "cm"),
+    
+    
+    axis.title = element_text(size = 6),
+    axis.text = element_text(size = 5)
+  )
 ```
 
 #### Corrected count data
@@ -2060,20 +2178,24 @@ nd <- data.frame(time_ka = seq(min(fit_df_taph$time_ka),
                                0.1))
 
 # draws x zones matrix for each nonlinear parameter
-get_par <- function(par) posterior_linpred(fit_time_4cp_taph, newdata = nd, nlpar = par)
+get_par <- function(par) posterior_linpred(fit_time_5cp_taph,
+                                           newdata = nd, nlpar = par)
 
-p <- lapply(c("beta1","beta2","beta3","beta4", "beta5", "cp1","cp2","cp3", "cp4"),
+p <- lapply(c("beta1","beta2","beta3","beta4", "beta5", "beta6",
+              "cp1","cp2","cp3", "cp4", "cp5"),
             get_par)
-names(p) <- c("beta1","beta2","beta3","beta4", "beta5", "cp1","cp2","cp3", "cp4")
+names(p) <- c("beta1","beta2","beta3","beta4", "beta5", "beta6",
+              "cp1","cp2","cp3", "cp4", "cp5")
 
 # Slopes (log-rate per ka), oldest -> youngest segments
 # Segment ordering assumes cp1 > cp2 > cp3 (older -> younger)
 slopes <- list(
-  seg_young_of_cp4   = p$beta1,                              # t < cp3
-  seg_cp4_to_cp3     = p$beta1 + p$beta5,                    # cp3 < t < cp2
-  seg_cp3_to_cp2     = p$beta1 + p$beta5 + p$beta4,          # cp2 < t < cp1
-  seg_cp2_to_cp1     = p$beta1 + p$beta5 + p$beta4 + p$beta3,
-  seg_older_than_cp1 = p$beta1 + p$beta5 + p$beta4 + p$beta3 + p$beta2 # t > cp1
+  seg_young_of_cp5   = p$beta1,                              # t < cp3
+  seg_cp5_to_cp4     = p$beta1 + p$beta6,                    # cp3 < t < cp2
+  seg_cp4_to_cp3     = p$beta1 + p$beta6 + p$beta5,          # cp2 < t < cp1
+  seg_cp3_to_cp2     = p$beta1 + p$beta6 + p$beta5 + p$beta4,
+  seg_cp2_to_cp1 = p$beta1 + p$beta6 + p$beta5 + p$beta4 + p$beta3,
+  seg_older_than_cp1 = p$beta1 + p$beta6 + p$beta5 + p$beta4 + p$beta3 + p$beta2
 )
 
 summ <- function(m, name) {
@@ -2090,7 +2212,8 @@ cp_summary <- bind_rows(
   summ(p$cp1, "CP1 (Robberg/Oakhurst)"),
   summ(p$cp2, "CP2 (Oakhurst/Wilton)"),
   summ(p$cp3, "CP3 (Wilton/final LSA)"),
-  summ(p$cp4, "CP4 (Wilton/final LSA)2")
+  summ(p$cp4, "CP4 (Wilton/final LSA)2"),
+  summ(p$cp5, "CP5 (Wilton/final LSA)3")
 ) %>%
   distinct(quantity, mean, .keep_all = TRUE) %>%
   mutate(
@@ -2107,6 +2230,7 @@ slope_summary <- bind_rows(lapply(names(slopes),
 
 # Slope change at each CP (just the hinge coefficient), with P(change > 0)
 change_summary <- bind_rows(
+  summ(p$beta6, "slope change at CP5"),
   summ(p$beta5, "slope change at CP4"),
   summ(p$beta4, "slope change at CP3"),
   summ(p$beta3, "slope change at CP2"),
@@ -2118,14 +2242,14 @@ change_summary <- bind_rows(
 ```{r}
 pred_grid <- tibble(
   time_ka = seq(
-    min(fit_df_taph$time_ka, na.rm = TRUE),
-    max(fit_df_taph$time_ka, na.rm = TRUE),
-    length.out = 100
+    min(fit_df$time_ka, na.rm = TRUE),
+    max(fit_df$time_ka, na.rm = TRUE),
+    length.out = 1000
   )
 )
 
 pred <- posterior_epred(
-  fit_time_4cp_taph,
+  fit_time_5cp_taph,
   newdata = pred_grid,
   re_formula = NULL,
   allow_new_levels = TRUE
@@ -2149,16 +2273,134 @@ pred_summary <- pred %>%
     upper = quantile(mu, 0.975),
     .groups = "drop"
   ) |>
-  mutate(calBP = (-time_ka * 1000) + mean(fit_df$calBP)) %>%
+  mutate(calBP = (-time_ka * 1000) + mean(fit_df_taph$calBP)) %>%
   
   filter(calBP < 27000, calBP > 500)
 
 
-png(paste0(dir, "/results/figures/Fig6A.png"), 
-    width = 2200, height = 800, res = 300)
 
-ggplot() +
+#####################################
+# Slope summary
+pred_grid_full <- tibble(
+  time_ka = seq(
+    min(fit_df_taph$time_ka, na.rm = TRUE),
+    max(fit_df_taph$time_ka, na.rm = TRUE),
+    length.out = nrow(fit_df_taph)
+  )
+)
+
+pred_full <- posterior_epred(
+  fit_time_5cp_taph,
+  newdata = pred_grid_full,
+  re_formula = NULL,
+  allow_new_levels = TRUE
+)
+
+
+
+# Difference between adjacent time points
+dt <- diff(pred_grid_full$time_ka)
+
+# Posterior slope for each draw
+slopes <- (pred_full[, -1] - pred_full[, -ncol(pred_full)]) /
+  rep(dt, each = nrow(pred_full))
+
+# Summarize posterior slopes
+slope_summary <- data.frame(
+  time_ka = pred_grid_full$time_ka[-1] -
+    dt / 2,
+  slope_mean = colMeans(slopes),
+  slope_lower = apply(slopes, 2, quantile, 0.025),
+  slope_upper = apply(slopes, 2, quantile, 0.975)
+) %>%
+  mutate(calBP = (-time_ka * 1000) + mean(fit_df_taph$calBP))
+
+slope_at_origin <- boundaries %>%
+  filter(RFZ == 'ZA') %>%
+  rowwise() %>%
+  mutate(
+    slope_summary %>%
+      slice_min(
+        abs(calBP - Origin),
+        n = 1
+      ) %>%
+      select(slope_mean, slope_lower, slope_upper)
+  ) %>%
+  ungroup()
+
+
+slope_at_termination <- boundaries %>%
+  filter(RFZ == 'ZA') %>%
+  rowwise() %>%
+  mutate(
+    slope_summary %>%
+      slice_min(
+        abs(calBP - Termination),
+        n = 1
+      ) %>%
+      select(slope_mean, slope_lower, slope_upper)
+  ) %>%
+  ungroup()
+
+
+slope_at_boundaries_taph <- rbind(slope_at_origin,
+                                  slope_at_termination)
+```
+
+```{r}
+fit_time_5cp_taph_gg <- 
+  ggplot() +
   
+  # Where the slope is no different than 0
+  geom_segment(
+    data = slope_summary %>%
+      mutate(calBP = round(calBP)) %>%
+      filter((slope_upper < 0 & slope_lower > 0) | 
+               (slope_upper > 0 & slope_lower < 0)) %>%
+      inner_join(
+        pred_summary %>%
+          mutate(calBP = round(calBP)),
+        by = "calBP"
+      ), 
+    aes(
+      x = calBP,
+      xend = calBP,
+      y = lower,
+      yend = upper
+    ),
+    color = "red"
+  ) +
+  
+  # Reset color scale
+  new_scale_color() +
+  
+  geom_rect(data = cp_summary,
+            aes(xmin = calBP_upr, xmax = calBP_lwr, 
+                ymin = 0, ymax = 0.4),
+            alpha = 0.3) +
+  
+  # Observed site counts
+  geom_segment(
+    data = fit_df %>% filter(calBP > 500, calBP < 27000, site_count > 0),
+    aes(
+      x = calBP,
+      xend = calBP,
+      y = -0.02,
+      yend = 0,
+      color = site_count
+    ),
+    linewidth = 0.5,
+    alpha = 0.7
+  ) +
+  
+  scale_color_gradient(
+    low = "grey85",
+    high = "orangered",
+    name = "Site count"
+  ) +
+  
+  # Reset color scale
+  new_scale_color() +
   
   # Bayesian credible interval
   geom_ribbon(
@@ -2180,57 +2422,80 @@ ggplot() +
       x = calBP,
       y = estimate
     ),
-    linewidth = 1,
+    linewidth = 0.3,
     color = 'black'
   ) +
   
-  geom_rect(data = cp_summary,
-            aes(xmin = calBP_upr, xmax = calBP_lwr, 
-                ymin = 0, ymax = 0.4),
-            alpha = 0.3) +
-  
   # Robberg 
-  geom_errorbar(aes(xmin = 9764, 
-                    xmax = 24727,
-                    y = 0.6), 
+  geom_errorbar(data = boundaries %>% filter(RFZ == 'ZA'),
+                aes(xmin = Termination, 
+                    xmax = Origin,
+                    y = 0.6, color = factor(Industry)), 
+                position = 'dodge',
                 width = 0.05, 
-                color = "orange", 
-                linewidth = 1) +
+                linewidth = 0.5) +
   
-  # Okakhurst
-  geom_errorbar(aes(xmin = 5519, 
-                    xmax = 14848,
-                    y = 0.55), 
-                width = 0.05, 
-                color = "darkblue", 
-                linewidth = 1) +
+  scale_color_manual(
+    values = c(
+      "Robberg" = "orange",
+      "Oakhurst" = "blue",
+      "Wilton" = "darkgreen",
+      'Final LSA' = "magenta"
+    ),
+    name = "Technological\nPeriod"
+  ) +
   
-  # Wilton
-  geom_errorbar(aes(xmin = 697, 
-                    xmax = 10725,
-                    y = 0.5), 
-                width = 0.05, 
-                color = "forestgreen", 
-                linewidth = 1) +
-  
-  # Final LSA
-  geom_errorbar(aes(xmin = 58, 
-                    xmax = 5892,
-                    y = 0.45), 
-                width = 0.05, 
-                color = "black", 
-                linewidth = 1) +
+  # Reset color scale
+  new_scale_color() +
   
   # Reverse BP axis
   scale_x_reverse() +
   
   labs(
     x = "Calibrated Years BP",
-    y = 'Radiocarbon Count',
+    y = 'Expected Adjusted Radiocarbon Count',
     fill = "Site Count"
   ) +
+  ylim(-0.02, 0.8) +
   
-  theme_minimal(base_size = 8)
+  theme_minimal() +
+  
+  theme(
+    # Reduce the font size of the legend title
+    legend.title = element_text(size = 5), 
+    
+    # Reduce the font size of the legend labels
+    legend.text = element_text(size = 4),
+    
+    # Shrink the size of the keys (the symbols/boxes)
+    legend.key.size = unit(0.3, "cm"),
+    
+    
+    axis.title = element_text(size = 6),
+    axis.text = element_text(size = 5)
+  )
+```
+
+```{r}
+# merge the slope estimates
+slope_5cp <- rbind(
+  slope_at_boundaries %>% mutate(date = 'Original'),
+  slope_at_boundaries_taph %>% mutate(date = 'Adjusted')
+)
+
+
+png(paste0(dir, "/results/figures/Fig4.png"), 
+    width = 1600, height = 800, res = 300)
+
+ggarrange(
+  fit_time_5cp_gg,
+  fit_time_5cp_taph_gg,
+  labels = c('A', 'B'),
+  vjust = 1.2, hjust = 0,
+  
+  common.legend = TRUE,
+  legend = 'right'
+)
 
 dev.off()
 ```
@@ -2370,12 +2635,14 @@ loo_rfz_cp0_taph <- loo(fit_time_rfz_s_taph)
 
 ```
 
+### Uncorrected count data
+
 ```{r}
 pred_grid <- tibble(
   time_ka = seq(
     min(fit_df$time_ka, na.rm = TRUE),
     max(fit_df$time_ka, na.rm = TRUE),
-    length.out = 100
+    length.out = length(fit_df %>% distinct(calBP) %>% pull(calBP))
   )
 ) %>%
   expand_grid(
@@ -2408,99 +2675,212 @@ pred_summary <- pred %>%
     .groups = "drop"
   ) |>
   mutate(calBP = (-time_ka * 1000) + mean(fit_df$calBP)) %>%
-  filter(calBP < 27000, calBP > 1500)
+  filter(calBP < 27000, calBP > 500)
 
 
-png(paste0(dir, "/results/figures/Fig6A.png"), 
-    width = 2200, height = 800, res = 300)
-
-ggplot() +
-  
-  geom_ribbon(
-    data = pred_summary,
-    aes(
-      x = calBP,
-      ymin = lower,
-      ymax = upper
-    ),
-    alpha = 0.25,
-    fill = "black",
-    color = NA
-  ) +
-  
-  # Posterior mean prediction
-  geom_line(
-    data = pred_summary,
-    aes(
-      x = calBP,
-      y = estimate
-    ),
-    linewidth = 1,
-    color = 'black'
-  ) +
-  
-  facet_wrap(~Zone_Name, scales = 'free') +
-  
-  # Reverse BP axis
-  scale_x_reverse() +
-  
-  labs(
-    x = "Calibrated Years BP",
-    y = 'Radiocarbon Count',
-    fill = "Site Count"
-  ) +
-  
-  theme_minimal(base_size = 8)
-
-dev.off()
-```
-
-```{r}
-pred_grid <- tibble(
+###############################
+# compute the slope summary
+pred_grid_full <- tibble(
   time_ka = seq(
-    min(fit_df_taph$time_ka, na.rm = TRUE),
-    max(fit_df_taph$time_ka, na.rm = TRUE),
-    length.out = 100
+    min(fit_df$time_ka, na.rm = TRUE),
+    max(fit_df$time_ka, na.rm = TRUE),
+    length.out = length(fit_df %>% distinct(calBP) %>% pull(calBP))
   )
 ) %>%
   expand_grid(
-    Zone_Name = unique(fit_df_taph$Zone_Name)
+    Zone_Name = unique(fit_df$Zone_Name)
   )
 
-pred <- posterior_epred(
-  fit_time_rfz_s_taph,
-  newdata = pred_grid,
+pred_full <- posterior_epred(
+  fit_time_rfz_s,
+  newdata = pred_grid_full,
   re_formula = NULL,
   allow_new_levels = TRUE
 )
 
 
-pred_summary <- pred %>%
-  t() %>%
-  as.data.frame() %>%
-  setNames(paste0("draw_", seq_len(ncol(.)))) %>%
-  bind_cols(pred_grid) %>%
-  pivot_longer(
-    cols = starts_with("draw_"),
-    names_to = "draw",
-    values_to = "mu"
-  ) %>%
-  group_by(time_ka, Zone_Name) %>%
-  summarise(
-    estimate = median(mu),
-    lower = quantile(mu, 0.025),
-    upper = quantile(mu, 0.975),
-    .groups = "drop"
+slope_summary <- map_dfr(
+  unique(pred_grid_full$Zone_Name),
+  function(z) {
+    
+    # Select grid rows for this zone
+    idx <- which(pred_grid_full$Zone_Name == z)
+    
+    # Extract posterior predictions
+    zone_pred <- pred_full[, idx, drop = FALSE]
+    
+    # Time differences
+    zone_time <- pred_grid_full$time_ka[idx]
+    dt <- diff(zone_time)
+    
+    # Posterior slopes
+    slopes <- (zone_pred[, -1, drop = FALSE] -
+                 zone_pred[, -ncol(zone_pred), drop = FALSE]) /
+      rep(dt, each = nrow(zone_pred))
+    
+    # Summarize
+    tibble(
+      Zone_Name = z,
+      time_ka = (zone_time[-1] + zone_time[-length(zone_time)]) / 2,
+      slope_mean = colMeans(slopes),
+      slope_lower = apply(slopes, 2, quantile, 0.025),
+      slope_upper = apply(slopes, 2, quantile, 0.975)
+    )
+  }
+) |>
+  mutate(
+    calBP = ((-time_ka * 1000) + mean(fit_df$calBP)) + 0.5
   ) |>
-  mutate(calBP = (-time_ka * 1000) + mean(fit_df_taph$calBP)) %>%
-  filter(calBP < 27000, calBP > 1500)
+  filter(calBP < 27000, calBP > 500)
 
 
-png(paste0(dir, "/results/figures/Fig6A.png"), 
-    width = 2200, height = 800, res = 300)
 
+slope_at_origin_w <- boundaries %>%
+  filter(RFZ == 'W') %>%
+  rowwise() %>%
+  mutate(
+    slope_summary %>%
+      filter(Zone_Name == 'W') %>%
+      slice_min(
+        abs(calBP - Origin),
+        n = 1
+      ) %>%
+      select(slope_mean, slope_lower, slope_upper)
+  ) %>%
+  ungroup()
+
+slope_at_origin_s <- boundaries %>%
+  filter(RFZ == 'S') %>%
+  rowwise() %>%
+  mutate(
+    slope_summary %>%
+      filter(Zone_Name == 'S') %>%
+      slice_min(
+        abs(calBP - Origin),
+        n = 1
+      ) %>%
+      select(slope_mean, slope_lower, slope_upper)
+  ) %>%
+  ungroup()
+
+slope_at_origin_y <- boundaries %>%
+  filter(RFZ == 'Y') %>%
+  rowwise() %>%
+  mutate(
+    slope_summary %>%
+      filter(Zone_Name == 'Y') %>%
+      slice_min(
+        abs(calBP - Origin),
+        n = 1
+      ) %>%
+      select(slope_mean, slope_lower, slope_upper)
+  ) %>%
+  ungroup()
+
+
+slope_at_termination_w <- boundaries %>%
+  filter(RFZ == 'W') %>%
+  rowwise() %>%
+  mutate(
+    slope_summary %>%
+      filter(Zone_Name == 'W') %>%
+      slice_min(
+        abs(calBP - Termination),
+        n = 1
+      ) %>%
+      select(slope_mean, slope_lower, slope_upper)
+  ) %>%
+  ungroup()
+
+slope_at_termination_s <- boundaries %>%
+  filter(RFZ == 'S') %>%
+  rowwise() %>%
+  mutate(
+    slope_summary %>%
+      filter(Zone_Name == 'S') %>%
+      slice_min(
+        abs(calBP - Termination),
+        n = 1
+      ) %>%
+      select(slope_mean, slope_lower, slope_upper)
+  ) %>%
+  ungroup()
+
+slope_at_termination_y <- boundaries %>%
+  filter(RFZ == 'Y') %>%
+  rowwise() %>%
+  mutate(
+    slope_summary %>%
+      filter(Zone_Name == 'Y') %>%
+      slice_min(
+        abs(calBP - Termination),
+        n = 1
+      ) %>%
+      select(slope_mean, slope_lower, slope_upper)
+  ) %>%
+  ungroup()
+
+
+slope_at_boundaries <- rbind(slope_at_origin_w,
+                             slope_at_origin_s,
+                             slope_at_origin_y,
+                             
+                             slope_at_termination_w,
+                             slope_at_termination_s,
+                             slope_at_termination_y)
+```
+
+```{r}
+#fit_time_rfz_0cp_gg <- 
 ggplot() +
   
+  # Where the slope is no different than 0
+  geom_segment(
+    data = slope_summary %>%
+      mutate(calBP = round(calBP)) %>%
+      filter(slope_lower < 0 & slope_upper > 0) %>%
+      inner_join(
+        pred_summary %>%
+          mutate(calBP = round(calBP)),
+        by = c("calBP", "Zone_Name")
+      ),
+    aes(
+      x = calBP,
+      xend = calBP,
+      y = lower,
+      yend = upper
+    ),
+    color = "red",
+    linewidth = 0.5
+  )+
+  
+  # Reset color scale
+  new_scale_color() +
+  
+  # Observed site counts
+  geom_segment(
+    data = fit_df %>% filter(calBP > 500, calBP < 27000, site_count > 0),
+    aes(
+      x = calBP,
+      xend = calBP,
+      y = -0.02,
+      yend = 0,
+      color = site_count
+    ),
+    linewidth = 0.5,
+    alpha = 0.7
+  ) +
+  
+  scale_color_gradient(
+    low = "grey85",
+    high = "orangered",
+    name = "Site count"
+  ) +
+  
+  # Reset color scale
+  new_scale_color() +
+  
+  # Bayesian credible interval
   geom_ribbon(
     data = pred_summary,
     aes(
@@ -2520,24 +2900,70 @@ ggplot() +
       x = calBP,
       y = estimate
     ),
-    linewidth = 1,
+    linewidth = 0.3,
     color = 'black'
   ) +
   
-  facet_wrap(~Zone_Name, scales = 'free') +
+  # Robberg 
+  geom_errorbar(data = boundaries %>% filter(RFZ != 'ZA') %>%
+                  rename(Zone_Name = RFZ),
+                aes(xmin = Termination, 
+                    xmax = Origin,
+                    y = 0.3, color = factor(Industry)), 
+                position = 'dodge',
+                width = 0.05, 
+                linewidth = 0.5) +
+  
+  scale_color_manual(
+    values = c(
+      "Robberg" = "orange",
+      "Oakhurst" = "blue",
+      "Wilton" = "darkgreen",
+      'Final LSA' = "magenta"
+    ),
+    name = "Technological\nPeriod"
+  ) +
+  
+  # Reset color scale
+  new_scale_color() +
   
   # Reverse BP axis
   scale_x_reverse() +
   
+  facet_wrap(~Zone_Name) +
+  
   labs(
     x = "Calibrated Years BP",
-    y = 'Radiocarbon Count',
+    y = 'Expected Radiocarbon Count',
     fill = "Site Count"
   ) +
   
-  theme_minimal(base_size = 8)
+  ylim(-0.02, 0.35) +
+  
+  theme_minimal() +
+  
+  theme(
+    # Reduce the font size of the legend title
+    legend.title = element_text(size = 5), 
+    
+    # Reduce the font size of the legend labels
+    legend.text = element_text(size = 4),
+    
+    # Shrink the size of the keys (the symbols/boxes)
+    legend.key.size = unit(0.3, "cm"),
+    
+    
+    axis.title = element_text(size = 6),
+    axis.text = element_text(size = 5)
+  )
+```
 
-dev.off()
+# STooped here on 11/06/2026
+
+#### Corrected count data
+
+```{r}
+
 ```
 
 ### 3 CP
